@@ -1,0 +1,296 @@
+package topology
+
+import (
+	"context"
+	"log/slog"
+	"net"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/cenkalti/backoff/v5"
+	pb "gitlab.com/gitlab-org/cells/topology-service/clients/go/proto"
+	types_proto "gitlab.com/gitlab-org/cells/topology-service/clients/go/proto/types/v1"
+	"gitlab.com/gitlab-org/gitlab-shell/v14/client"
+	"gitlab.com/gitlab-org/labkit/v2/log"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+const (
+	classifyMaxAttempts     = 3
+	classifyInitialInterval = 50 * time.Millisecond
+	classifyMaxInterval     = 250 * time.Millisecond
+)
+
+// Resolver queries the Topology Service to determine which cell should
+// handle a request. It gracefully degrades: if the TS is disabled,
+// unreachable, or returns an error, an empty string is returned and
+// the caller should use the default host.
+type Resolver struct {
+	client       *Client
+	cellEndpoint CellEndpointConfig
+}
+
+// RoutedClient holds an HTTP client that may have been routed to a
+// specific cell, along with that cell's address. When the Topology
+// Service is not configured or returned a non-PROXY response, Address
+// is empty and Client is the original unmodified client.
+//
+// Obtain via [Resolver.ClientForSSHFingerprint], [Resolver.ClientForRoute], or
+// [Resolver.ClientForUserArgs]; the zero value is not valid for use.
+type RoutedClient struct {
+	Client  *client.GitlabNetClient
+	Address string
+}
+
+// UserArgs holds the user identity fields needed for cell resolution.
+// It mirrors the relevant fields from commandargs.Shell but avoids
+// importing the command layer into the topology package.
+type UserArgs struct {
+	Username      string
+	KeyID         string
+	Krb5Principal string
+}
+
+// NewResolver creates a new Resolver. If client is nil (TS disabled), all
+// resolve calls return empty string immediately. The cellEndpoint config
+// determines the scheme and port used when constructing routed internal API
+// URLs from Topology Service responses.
+func NewResolver(client *Client, cellEndpoint CellEndpointConfig) *Resolver {
+	return &Resolver{client: client, cellEndpoint: cellEndpoint}
+}
+
+// ClientForSSHKey resolves the cell that owns key and returns a RoutedClient.
+// When the Topology Service is not configured, returns an error, or returns a
+// non-PROXY action, Address is empty and Client is the original httpClient.
+//
+// Deprecated: Use ClientForSSHFingerprint instead to classify by SHA-256 fingerprint.
+func (r *Resolver) ClientForSSHKey(ctx context.Context, httpClient *client.GitlabNetClient, key string) RoutedClient {
+	return attachHost(httpClient, r.resolveBySSHKey(ctx, key))
+}
+
+// ClientForSSHFingerprint resolves the cell that owns the SSH key identified by
+// its SHA-256 fingerprint and returns a RoutedClient.
+// The fingerprint must be the raw base64 body (43 chars), without the "SHA256:" prefix.
+// When the Topology Service is not configured, returns an error, or returns a
+// non-PROXY action, Address is empty and Client is the original httpClient.
+func (r *Resolver) ClientForSSHFingerprint(ctx context.Context, httpClient *client.GitlabNetClient, fingerprint string) RoutedClient {
+	return attachHost(httpClient, r.resolveBySSHFingerprint(ctx, fingerprint))
+}
+
+// ClientForRoute resolves the cell that owns repoPath and returns a RoutedClient.
+// When the Topology Service is not configured, returns an error, or returns a
+// non-PROXY action, Address is empty and Client is the original httpClient.
+func (r *Resolver) ClientForRoute(ctx context.Context, httpClient *client.GitlabNetClient, repoPath string) RoutedClient {
+	return attachHost(httpClient, r.resolveByRoute(ctx, repoPath))
+}
+
+// ClientForUserArgs resolves the cell that owns the user identity in args
+// and returns a RoutedClient. When the Topology Service is not configured,
+// returns an error, or returns a non-PROXY action, Address is empty and
+// Client is the original httpClient.
+func (r *Resolver) ClientForUserArgs(ctx context.Context, httpClient *client.GitlabNetClient, args UserArgs) RoutedClient {
+	return attachHost(httpClient, r.resolveByUserArgs(ctx, args))
+}
+
+// ExtractTopLevelNamespace returns the first path segment from a
+// repository path (the top-level namespace in GitLab).
+// Examples:
+//   - "group/project.git" → "group"
+//   - "group" → "group" (single-segment paths are valid for top-level namespaces)
+//   - "" → ""
+func ExtractTopLevelNamespace(repo string) string {
+	repo = strings.TrimLeft(repo, "/")
+	repo = strings.TrimSuffix(repo, ".git")
+	if i := strings.IndexByte(repo, '/'); i > 0 {
+		return repo[:i]
+	}
+	return repo
+}
+
+// resolve queries the Topology Service with the given claim and returns
+// the proxy address as an HTTP(S) URL string. The scheme and port come from
+// the explicit cell endpoint configuration. Returns empty string on any
+// failure or when TS is not configured. Transient errors are retried with
+// exponential backoff.
+func (r *Resolver) resolve(ctx context.Context, claim *types_proto.Claim) string {
+	if r == nil || r.client == nil || claim == nil {
+		return ""
+	}
+
+	b := backoff.NewExponentialBackOff()
+	b.InitialInterval = classifyInitialInterval
+	b.MaxInterval = classifyMaxInterval
+
+	resp, err := backoff.Retry(ctx, func() (*pb.ClassifyResponse, error) {
+		resp, err := r.client.Classify(ctx, claim)
+		if err != nil && !isRetryableError(err) {
+			return resp, backoff.Permanent(err)
+		}
+		return resp, err
+	},
+		backoff.WithBackOff(b),
+		backoff.WithMaxTries(classifyMaxAttempts),
+		backoff.WithNotify(func(err error, duration time.Duration) {
+			log.FromContext(ctx).InfoContext(ctx, "Topology Service classify attempt failed, retrying",
+				slog.Float64("retry_in_s", duration.Seconds()),
+				log.ErrorMessage(err.Error()),
+			)
+		}),
+	)
+	if err != nil {
+		log.FromContext(ctx).WarnContext(ctx, "Topology Service classify failed after retries, falling back to default host",
+			slog.Int("max_attempts", classifyMaxAttempts),
+			log.ErrorMessage(err.Error()),
+		)
+		return ""
+	}
+
+	if resp.GetAction() == pb.ClassifyAction_PROXY && resp.GetProxy() != nil {
+		address := resp.GetProxy().GetAddress()
+		if address == "" {
+			log.FromContext(ctx).WarnContext(ctx, "Topology Service returned a PROXY action with an empty cell address, falling back to default host")
+			return ""
+		}
+
+		url := r.buildCellURL(address)
+		if url == "" {
+			log.FromContext(ctx).WarnContext(ctx, "Topology Service returned an unusable cell address, falling back to default host",
+				slog.String("address", address))
+			return ""
+		}
+
+		log.FromContext(ctx).DebugContext(ctx, "Topology Service resolved cell address",
+			slog.String("address", url))
+		return url
+	}
+
+	log.FromContext(ctx).DebugContext(ctx, "Topology Service returned non-PROXY response, falling back to default host",
+		slog.String("action", resp.GetAction().String()))
+
+	return ""
+}
+
+// buildCellURL constructs the routed internal API URL from a Topology
+// Service-provided address using the explicit cell endpoint configuration.
+// Any port present in the address is stripped and replaced with the
+// configured port; the configured scheme is always used.
+//
+// It defensively rejects addresses that are not a bare host or host:port:
+// anything containing a path separator ("/") or with an empty host.
+// Only IPv4 addresses and hostnames are supported; IPv6 is rejected.
+func (r *Resolver) buildCellURL(address string) string {
+	if strings.Contains(address, "/") {
+		return ""
+	}
+
+	host := address
+	if h, _, err := net.SplitHostPort(address); err == nil {
+		host = h
+	}
+
+	if host == "" || isIPv6(host) {
+		return ""
+	}
+
+	u := url.URL{
+		Scheme: r.cellEndpoint.Scheme,
+		Host:   net.JoinHostPort(host, strconv.Itoa(r.cellEndpoint.Port)),
+	}
+	return u.String()
+}
+
+// isIPv6 reports whether host is an IPv6 literal. It assumes the port has
+// already been stripped, so a remaining ":" can only be IPv6, which is
+// unsupported: cells are addressed by hostname or IPv4.
+func isIPv6(host string) bool {
+	return strings.Contains(host, ":")
+}
+
+// resolveByRoute resolves a cell address from a repository path.
+// It extracts the top-level namespace and creates a RouteClaim.
+// Suitable for repo-scoped endpoints: /allowed, /lfs_authenticate, /git_audit_event.
+func (r *Resolver) resolveByRoute(ctx context.Context, repoPath string) string {
+	if r == nil {
+		return ""
+	}
+	namespace := ExtractTopLevelNamespace(repoPath)
+	if namespace == "" {
+		return ""
+	}
+	return r.resolve(ctx, RouteClaim(namespace))
+}
+
+// Deprecated: resolveBySSHKey resolves a cell address from an SSH key identifier.
+// Use resolveBySSHFingerprint instead to classify by SHA-256 fingerprint.
+func (r *Resolver) resolveBySSHKey(ctx context.Context, key string) string {
+	if r == nil {
+		return ""
+	}
+	if key == "" {
+		return ""
+	}
+	return r.resolve(ctx, SSHKeyClaim(key))
+}
+
+// resolveBySSHFingerprint resolves a cell address from an SSH key's SHA-256 fingerprint.
+// The fingerprint is the raw base64 body (43 chars, no "SHA256:" prefix),
+// matching the format in keys.fingerprint_sha256.
+func (r *Resolver) resolveBySSHFingerprint(ctx context.Context, fingerprint string) string {
+	if r == nil {
+		return ""
+	}
+	if fingerprint == "" {
+		return ""
+	}
+	return r.resolve(ctx, SSHFingerprintClaim(fingerprint))
+}
+
+// resolveByUserArgs resolves a cell address from the user identity in
+// command arguments. It picks the best available claim type:
+//   - Username → UsernameClaim
+//   - KeyID / Krb5Principal → returns "" (default host fallback, no matching
+//     Topology Service claim type)
+//
+// This is used for user-scoped endpoints (/discover, /two_factor_recovery_codes,
+// /two_factor_manual_otp_check, /two_factor_push_otp_check, /personal_access_token)
+// that have no repository path for route-based classification.
+func (r *Resolver) resolveByUserArgs(ctx context.Context, args UserArgs) string {
+	if r == nil {
+		return ""
+	}
+	if args.Username != "" {
+		return r.resolve(ctx, UsernameClaim(args.Username))
+	}
+	return ""
+}
+
+// attachHost returns a RoutedClient. If addr is non-empty, the client
+// is re-targeted to addr via WithHost; otherwise it is returned as-is.
+func attachHost(c *client.GitlabNetClient, addr string) RoutedClient {
+	if addr == "" {
+		return RoutedClient{Client: c}
+	}
+	return RoutedClient{Client: c.WithHost(addr), Address: addr}
+}
+
+// isRetryableError returns true if the gRPC error is transient and the
+// request should be retried. Non-gRPC errors are assumed retryable
+// (e.g., connection failures).
+func isRetryableError(err error) bool {
+	s, ok := status.FromError(err)
+	if !ok {
+		// Not a gRPC status error (e.g., connection error) — retry.
+		return true
+	}
+
+	switch s.Code() {
+	case codes.Unavailable, codes.ResourceExhausted, codes.Aborted,
+		codes.Internal, codes.DeadlineExceeded, codes.Unknown:
+		return true
+	default:
+		return false
+	}
+}

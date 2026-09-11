@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -31,7 +32,10 @@ const (
 // ErrCafileNotFound indicates that the specified CA file was not found
 var ErrCafileNotFound = errors.New("cafile not found")
 
-// HTTPClient provides an HTTP client with retry capabilities
+// HTTPClient provides an HTTP client with retry capabilities.
+// Fields other than Host must be safe to share across shallow copies,
+// because GitlabNetClient.WithHost creates a copy with a different Host
+// while sharing the same RetryableHTTP transport.
 type HTTPClient struct {
 	RetryableHTTP *retryablehttp.Client
 	Host          string
@@ -126,9 +130,56 @@ func NewHTTPClientWithOpts(gitlabURL, gitlabRelativeURLRoot, caFile, caPath stri
 	c.HTTPClient.Transport = NewTransport(transport)
 	c.HTTPClient.Timeout = readTimeout(readTimeoutSeconds)
 
+	// The internal API (/api/v4/internal/*) must never be redirected. Go's
+	// default redirect policy follows 3xx responses and, on a 301/302/303,
+	// downgrades a POST to a GET and drops the body. That silently misroutes
+	// internal API requests (e.g. to a public host that bounces http->https),
+	// turning them into method-downgraded GETs that 404. Refuse to follow
+	// redirects so they surface as errors instead; parseError reports any
+	// status matching IsFollowedRedirect as a failure.
+	c.HTTPClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
 	client := &HTTPClient{RetryableHTTP: c, Host: host}
 
 	return client, nil
+}
+
+// IsFollowedRedirect reports whether code is one of the 3xx statuses that Go's
+// http.Client would follow, i.e. the ones a CheckRedirect hook intercepts. A
+// followed redirect downgrades a POST to a GET on 301/302/303 and drops the
+// body, so internal API clients refuse them and treat them as errors.
+//
+// 300 Multiple Choices and 304/305/306 are deliberately excluded: Go does not
+// follow them, and the GitLab internal API uses 300 for custom actions (e.g.
+// Geo) whose body must be parsed normally.
+func IsFollowedRedirect(code int) bool {
+	switch code {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsSystemErrorStatus reports whether an HTTP status from the internal API
+// unambiguously indicates a gitlab-shell/infrastructure failure. Transport-layer
+// logging and APIError.System both use this status-only classification.
+//
+//   - Followed redirects (301/302/303/307/308): misroute → system.
+//   - 400 Bad Request: shell-facing internal API endpoints map policy outcomes
+//     to 401/403/404/422; a 400 indicates a malformed request from
+//     gitlab-shell, such as grape parameter-validation failures or bad_request!
+//     on a corrupt gitaly_client_context_bin → system.
+//   - 5xx: server-side failure → system.
+//
+// Other 4xx responses (401/403/404/422/429) are expected policy responses.
+// parseError reuses this function so that error-level logging and the error-SLI
+// (APIError.System) classification agree.
+func IsSystemErrorStatus(code int) bool {
+	return IsFollowedRedirect(code) || code == http.StatusBadRequest || code >= 500
 }
 
 func buildSocketTransport(gitlabURL, gitlabRelativeURLRoot string) (*http.Transport, string) {
@@ -202,9 +253,9 @@ func buildHTTPTransport(gitlabURL string) (*http.Transport, string) {
 }
 
 func readTimeout(timeoutSeconds uint64) time.Duration {
-	if timeoutSeconds == 0 {
+	if timeoutSeconds == 0 || timeoutSeconds > math.MaxInt64 {
 		timeoutSeconds = defaultReadTimeoutSeconds
 	}
 
-	return time.Duration(timeoutSeconds) * time.Second
+	return time.Duration(timeoutSeconds) * time.Second // #nosec G115
 }

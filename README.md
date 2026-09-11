@@ -28,7 +28,6 @@ Development documentation for GitLab Shell [has moved into the `gitlab` reposito
 | `client/` | HTTP and GitLab client logic that is used internally and by other modules, e.g. Gitaly. |
 | `bin/` | Compiled binaries are created here. |
 | `support/` | Scripts and tools that assist in development and/or testing. |
-| `spec/` | Ruby based integration tests. |
 
 ## Building
 
@@ -44,6 +43,14 @@ Run `make test`.
 2. Once `gitlab-org/gitlab-shell` MR is merged, create the corresponding git tag, e.g. https://gitlab.com/gitlab-org/gitlab-shell/-/tags/v14.39.0.
 3. Create a `gitlab-org/gitlab` MR to update [`GITLAB_SHELL_VERSION`](https://gitlab.com/gitlab-org/gitlab/-/blob/master/GITLAB_SHELL_VERSION) to the proposed tag, e.g. [Bump GitLab Shell to 14.39.0](https://gitlab.com/gitlab-org/gitlab/-/merge_requests/162661).
 4. Announce in `#gitlab-shell` a new version has been created.
+
+## Tag Management Guidelines
+
+This repository is mirrored to security and dev mirrors. Mirror syncs happen within minutes of changes to the canonical repo, so please follow these guidelines when managing tags:
+
+1. **Use caution when deleting and recreating tags** - if a tag has already been synced to the mirrors, recreating it will cause SHA divergence and break the mirror sync.
+2. **If a tag needs to be re-created**, [create an issue on the Delivery tracker](https://gitlab.com/gitlab-com/gl-infra/delivery/-/issues/new) and coordinate with the release managers to delete the tag from all mirrors (security + dev) before recreating it on canonical.
+3. **If a mirror sync fails due to tag SHA divergence**, contact the release managers in `#g_release_and_deploy` to manually fix the mirrors.
 
 ## Licensing
 

@@ -5,7 +5,7 @@ import (
 	"context"
 	"fmt"
 
-	pb "gitlab.com/gitlab-org/gitaly/v16/proto/go/gitalypb"
+	pb "gitlab.com/gitlab-org/gitaly/v18/proto/go/gitalypb"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/client"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/commandargs"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/config"
@@ -36,20 +36,42 @@ type Request struct {
 	Protocol      string                            `json:"protocol"`
 	Repo          string                            `json:"gl_repository"`
 	Username      string                            `json:"username"`
+	KeyID         int                               `json:"key_id,omitempty"`
 	PackfileStats *pb.PackfileNegotiationStatistics `json:"packfile_stats,omitempty"`
+	CheckIP       string                            `json:"check_ip,omitempty"`
+	Changes       string                            `json:"changes"`
+	NamespacePath string                            `json:"namespace_path,omitempty"`
+}
+
+// AuditParams contains parameters for sending an audit event.
+type AuditParams struct {
+	Username      string
+	KeyID         int
+	Repo          string
+	PackfileStats *pb.PackfileNegotiationStatistics
+	CellAddress   string
 }
 
 // Audit sends an audit event to the GitLab API.
-func (c *Client) Audit(ctx context.Context, username string, action commandargs.CommandType, repo string, packfileStats *pb.PackfileNegotiationStatistics) error {
+func (c *Client) Audit(ctx context.Context, params AuditParams, args *commandargs.Shell) error {
 	request := &Request{
-		Action:        action,
-		Repo:          repo,
+		Action:        args.CommandType,
+		Repo:          params.Repo,
 		Protocol:      "ssh",
-		Username:      username,
-		PackfileStats: packfileStats,
+		Username:      params.Username,
+		KeyID:         params.KeyID,
+		PackfileStats: params.PackfileStats,
+		CheckIP:       gitlabnet.ParseIP(args.Env.RemoteAddr),
+		Changes:       "_any",
+		NamespacePath: args.Env.NamespacePath,
 	}
 
-	response, err := c.client.Post(ctx, uri, request)
+	httpClient := c.client
+	if params.CellAddress != "" {
+		httpClient = httpClient.WithHost(params.CellAddress)
+	}
+
+	response, err := httpClient.Post(ctx, uri, request)
 	if err != nil {
 		return err
 	}

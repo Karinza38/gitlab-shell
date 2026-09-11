@@ -3,14 +3,16 @@ package accessverifier
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 
-	pb "gitlab.com/gitlab-org/gitaly/v16/proto/go/gitalypb"
+	pb "gitlab.com/gitlab-org/gitaly/v18/proto/go/gitalypb"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/client"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/commandargs"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/config"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/gitlabnet"
+	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/topology"
 )
 
 const (
@@ -20,7 +22,8 @@ const (
 
 // Client is a client for accessing resources
 type Client struct {
-	client *client.GitlabNetClient
+	client   *client.GitlabNetClient
+	resolver *topology.Resolver
 }
 
 // Request represents a request for accessing resources
@@ -48,16 +51,13 @@ type Gitaly struct {
 
 // CustomPayloadData represents custom payload data
 type CustomPayloadData struct {
-	APIEndpoints                            []string          `json:"api_endpoints"`
-	Username                                string            `json:"gl_username"`
-	PrimaryRepo                             string            `json:"primary_repo"`
-	UserID                                  string            `json:"gl_id,omitempty"`
-	RequestHeaders                          map[string]string `json:"request_headers"`
-	GeoProxyDirectToPrimary                 bool              `json:"geo_proxy_direct_to_primary"`
-	GeoProxyFetchDirectToPrimary            bool              `json:"geo_proxy_fetch_direct_to_primary"`
-	GeoProxyFetchDirectToPrimaryWithOptions bool              `json:"geo_proxy_fetch_direct_to_primary_with_options"`
-	GeoProxyFetchSSHDirectToPrimary         bool              `json:"geo_proxy_fetch_ssh_direct_to_primary"`
-	GeoProxyPushSSHDirectToPrimary          bool              `json:"geo_proxy_push_ssh_direct_to_primary"`
+	APIEndpoints                    []string          `json:"api_endpoints"`
+	Username                        string            `json:"gl_username"`
+	PrimaryRepo                     string            `json:"primary_repo"`
+	UserID                          string            `json:"gl_id,omitempty"`
+	RequestHeaders                  map[string]string `json:"request_headers"`
+	GeoProxyFetchSSHDirectToPrimary bool              `json:"geo_proxy_fetch_ssh_direct_to_primary"`
+	GeoProxyPushSSHDirectToPrimary  bool              `json:"geo_proxy_push_ssh_direct_to_primary"`
 }
 
 // CustomPayload represents a custom payload
@@ -85,7 +85,15 @@ type Response struct {
 	Who              string
 	StatusCode       int
 	// NeedAudit indicates whether git event should be audited to rails.
-	NeedAudit bool `json:"need_audit"`
+	NeedAudit   bool            `json:"need_audit"`
+	RetryConfig json.RawMessage `json:"retry_config,omitempty"`
+	// CellAddress is the URL of the cell that owns this repository,
+	// resolved by the Topology Service during the /allowed call.
+	// Empty when the Topology Service is not configured or returned
+	// a non-PROXY response. Downstream API calls (e.g., /lfs_authenticate,
+	// /git_audit_event) should reuse this address instead of making
+	// additional Topology Service queries.
+	CellAddress string `json:"-"`
 }
 
 // NewClient creates a new instance of Client
@@ -95,7 +103,10 @@ func NewClient(config *config.Config) (*Client, error) {
 		return nil, fmt.Errorf("error creating http client: %v", err)
 	}
 
-	return &Client{client: client}, nil
+	return &Client{
+		client:   client,
+		resolver: config.NewTopologyResolver(),
+	}, nil
 }
 
 // Verify verifies access to a GitLab resource
@@ -119,13 +130,20 @@ func (c *Client) Verify(ctx context.Context, args *commandargs.Shell, action com
 
 	request.CheckIP = gitlabnet.ParseIP(args.Env.RemoteAddr)
 
-	response, err := c.client.Post(ctx, "/allowed", request)
+	routed := c.resolver.ClientForRoute(ctx, c.client, repo)
+
+	response, err := routed.Client.Post(ctx, "/allowed", request)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = response.Body.Close() }()
 
-	return parse(response, args)
+	resp, err := parse(response, args)
+	if err != nil {
+		return nil, err
+	}
+	resp.CellAddress = routed.Address
+	return resp, nil
 }
 
 func parse(hr *http.Response, args *commandargs.Shell) (*Response, error) {
@@ -143,6 +161,13 @@ func parse(hr *http.Response, args *commandargs.Shell) (*Response, error) {
 	response.StatusCode = hr.StatusCode
 
 	return response, nil
+}
+
+// IsCellRouted returns true when the /allowed request was routed to a
+// different Cell via the Topology Service. In this case, Gitaly is not
+// directly reachable and SSH-over-HTTP must be used.
+func (r *Response) IsCellRouted() bool {
+	return r.CellAddress != ""
 }
 
 // IsCustomAction checks if the response indicates a custom action

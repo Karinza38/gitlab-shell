@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,11 +17,12 @@ import (
 )
 
 const (
-	internalAPIPath     = "/api/v4/internal"
-	apiSecretHeaderName = "Gitlab-Shell-Api-Request" // #nosec G101
-	defaultUserAgent    = "GitLab-Shell"
-	jwtTTL              = time.Minute
-	jwtIssuer           = "gitlab-shell"
+	internalAPIPath        = "/api/v4/internal"
+	apiSecretHeaderName    = "Gitlab-Shell-Api-Request" // #nosec G101
+	defaultUserAgent       = "GitLab-Shell"
+	jwtTTL                 = time.Minute
+	jwtIssuer              = "gitlab-shell"
+	internalAPIUnreachable = "Internal API unreachable"
 )
 
 // ErrorResponse represents an error response from the API
@@ -40,6 +42,17 @@ type GitlabNetClient struct {
 // APIError represents an API error
 type APIError struct {
 	Msg string
+
+	// StatusCode is the HTTP status returned by the internal API, or 0 when the
+	// request never produced a response (e.g. a connection failure).
+	StatusCode int
+
+	// System reports whether this is an internal API / transport failure
+	// (unreachable, a followed redirect, 400, or 5xx) rather than an expected
+	// policy response from the API (e.g. "You are not allowed to push").
+	// System errors indicate a gitlab-shell/infrastructure problem and should
+	// count toward error SLIs; policy responses are expected and should not.
+	System bool
 }
 
 // OriginalRemoteIPContextKey is used as the key in a Context to set an X-Forwarded-For header in a request
@@ -47,6 +60,30 @@ type OriginalRemoteIPContextKey struct{}
 
 func (e *APIError) Error() string {
 	return e.Msg
+}
+
+// NewSystemAPIError creates an APIError that represents an internal API or
+// transport failure (e.g. unreachable host, followed redirect, 400, or 5xx).
+// System errors count toward error SLIs; use a plain APIError for
+// expected policy responses (e.g. access denied).
+func NewSystemAPIError(msg string, statusCode int) *APIError {
+	return &APIError{Msg: msg, StatusCode: statusCode, System: true}
+}
+
+// NewTransportAPIError classifies a transport-level failure that produced no
+// HTTP response (nil response and/or a non-nil request error). The StatusCode
+// is always 0, since no response was received. A canceled context means the
+// caller went away mid-request (e.g. the SSH client disconnected), which is a
+// client-side outcome and must not count toward the server-side error SLIs.
+// Every other transport failure (a timeout, connection refused, DNS resolution
+// failure, etc.) is a genuine server-side/infrastructure problem and is marked
+// as a System error.
+func NewTransportAPIError(msg string, cause error) *APIError {
+	return &APIError{
+		Msg:        msg,
+		StatusCode: 0,
+		System:     !errors.Is(cause, context.Canceled),
+	}
 }
 
 // NewGitlabNetClient creates a new GitlabNetClient instance
@@ -109,9 +146,20 @@ func newRequest(ctx context.Context, method, host, path string, data interface{}
 	return request, nil
 }
 
-func parseError(resp *http.Response, respErr error) error {
-	if resp == nil || respErr != nil {
-		return &APIError{"Internal API unreachable"}
+func parseError(resp *http.Response) error {
+	// Redirects are never followed for internal API requests (see
+	// NewHTTPClientWithOpts). If one of the redirect status codes that Go's
+	// client would otherwise follow comes back, the request was misrouted to a
+	// host that wants to redirect us; surface it instead of treating it as
+	// success and silently parsing the redirect body. Note 300 Multiple Choices
+	// is NOT a redirect here: the internal API uses it for custom actions (e.g.
+	// Geo) and its body must be parsed normally.
+	if IsFollowedRedirect(resp.StatusCode) {
+		defer func() { _ = resp.Body.Close() }()
+		return NewSystemAPIError(
+			fmt.Sprintf("Internal API returned redirect (%d) to %q", resp.StatusCode, resp.Header.Get("Location")),
+			resp.StatusCode,
+		)
 	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode <= 399 {
@@ -121,9 +169,37 @@ func parseError(resp *http.Response, respErr error) error {
 	parsedResponse := &ErrorResponse{}
 
 	if err := json.NewDecoder(resp.Body).Decode(parsedResponse); err != nil {
-		return &APIError{fmt.Sprintf("Internal API error (%v)", resp.StatusCode)}
+		// No structured body to interpret. Classify by status code so this agrees
+		// with the transport-layer logging (IsSystemErrorStatus): only followed
+		// redirects, 400, and 5xx are treated as system failures. A non-system 4xx
+		// with an empty or unparseable body (e.g. a 404 for an unknown SSH key) is
+		// still an expected client/policy response and must not count toward the
+		// error SLIs.
+		return &APIError{
+			Msg:        fmt.Sprintf("Internal API error (%v)", resp.StatusCode),
+			StatusCode: resp.StatusCode,
+			System:     IsSystemErrorStatus(resp.StatusCode),
+		}
 	}
-	return &APIError{parsedResponse.Message}
+	// A decoded {"message":…} body is a structured response from the API.
+	// Classify via IsSystemErrorStatus so logging and SLI classification agree:
+	// followed redirects, 400, and 5xx are system failures; other 4xx (e.g. 403
+	// access denied, 404 key not found) are expected policy responses.
+	return &APIError{
+		Msg:        parsedResponse.Message,
+		StatusCode: resp.StatusCode,
+		System:     IsSystemErrorStatus(resp.StatusCode),
+	}
+}
+
+func checkResponse(response *http.Response, respErr error) (*http.Response, error) {
+	if response == nil || respErr != nil {
+		return nil, NewTransportAPIError(internalAPIUnreachable, respErr)
+	}
+	if err := parseError(response); err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
 // Get makes a GET request
@@ -138,12 +214,8 @@ func (c *GitlabNetClient) Post(ctx context.Context, path string, data interface{
 
 // Do executes a request
 func (c *GitlabNetClient) Do(request *http.Request) (*http.Response, error) {
-	response, respErr := c.httpClient.RetryableHTTP.HTTPClient.Do(request)
-	if err := parseError(response, respErr); err != nil {
-		return nil, err
-	}
-
-	return response, nil
+	response, respErr := c.httpClient.RetryableHTTP.HTTPClient.Do(request) // #nosec G704 -- request is constructed by internal callers
+	return checkResponse(response, respErr)
 }
 
 // DoRequest executes a request with the given method, path, and data
@@ -174,9 +246,42 @@ func (c *GitlabNetClient) DoRequest(ctx context.Context, method, path string, da
 	request.Header.Add("User-Agent", c.userAgent)
 
 	response, respErr := c.httpClient.RetryableHTTP.Do(request)
-	if err := parseError(response, respErr); err != nil {
-		return nil, err
-	}
+	return checkResponse(response, respErr)
+}
 
-	return response, nil
+// ShellClaims extends RegisteredClaims with the gl_id field needed for
+// Cells SSH-over-HTTP authentication.
+type ShellClaims struct {
+	jwt.RegisteredClaims
+	GlID string `json:"gl_id,omitempty"`
+}
+
+// SignShellJWT creates a Shell JWT token with a gl_id claim, signed with
+// the given secret. This is used for Cells SSH-over-HTTP routing where
+// gitlab-shell authenticates with a remote Cell's Workhorse/Rails.
+func SignShellJWT(secret, glID string) (string, error) {
+	now := time.Now()
+	claims := ShellClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    jwtIssuer,
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(jwtTTL)),
+		},
+		GlID: glID,
+	}
+	secretBytes := []byte(strings.TrimSpace(secret))
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(secretBytes)
+}
+
+// WithHost returns a shallow copy of the client that sends requests to the
+// specified host instead of the default one. The returned client shares the
+// same HTTP transport, TLS settings, and authentication credentials.
+// This is used for Cells routing where the Topology Service directs
+// requests to a specific cell.
+func (c *GitlabNetClient) WithHost(host string) *GitlabNetClient {
+	clone := *c
+	hostCopy := *c.httpClient
+	hostCopy.Host = host
+	clone.httpClient = &hostCopy
+	return &clone
 }

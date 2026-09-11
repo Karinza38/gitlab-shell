@@ -2,12 +2,13 @@
 package client
 
 import (
+	"log/slog"
 	"net/http"
 	"time"
 
 	"gitlab.com/gitlab-org/labkit/correlation"
-	"gitlab.com/gitlab-org/labkit/log"
 	"gitlab.com/gitlab-org/labkit/tracing"
+	"gitlab.com/gitlab-org/labkit/v2/log"
 )
 
 type transport struct {
@@ -28,32 +29,36 @@ func (rt *transport) RoundTrip(request *http.Request) (*http.Response, error) {
 	start := time.Now()
 
 	response, err := rt.next.RoundTrip(request)
-
-	fields := log.Fields{
-		"method":      request.Method,
-		"url":         request.URL.String(),
-		"duration_ms": time.Since(start) / time.Millisecond,
-	}
-	logger := log.WithContextFields(ctx, fields)
-
+	ctx = log.AppendFields(ctx,
+		log.HTTPMethod(request.Method),
+		log.HTTPURL(request.URL.String()),
+		log.DurationS(time.Since(start)),
+	)
 	if err != nil {
-		logger.WithError(err).Error("Internal API unreachable")
+		log.FromContext(ctx).ErrorContext(ctx, "Internal API unreachable", log.ErrorMessage(err.Error()))
 		return response, err
 	}
 
-	logger = logger.WithField("status", response.StatusCode)
+	ctx = log.AppendFields(ctx, log.HTTPStatusCode(response.StatusCode))
+
+	if IsSystemErrorStatus(response.StatusCode) {
+		// Redirect misroute, 400 malformed request, or 5xx: a gitlab-shell/infra failure.
+		log.FromContext(ctx).ErrorContext(ctx, "Internal API error")
+		return response, err
+	}
 
 	if response.StatusCode >= 400 {
-		logger.WithError(err).Error("Internal API error")
+		// Expected policy response (e.g. authorized_keys 404 "Key Not Found",
+		// access denied). Log for visibility but keep it out of error-level
+		// signals/SLOs.
+		log.FromContext(ctx).InfoContext(ctx, "Internal API returned a client error")
 		return response, err
 	}
 
 	if response.ContentLength >= 0 {
-		logger = logger.WithField("content_length_bytes", response.ContentLength)
+		ctx = log.AppendFields(ctx, slog.Int64("content_length_bytes", response.ContentLength))
 	}
-
-	logger.Info("Finished HTTP request")
-
+	log.FromContext(ctx).InfoContext(ctx, "Finished HTTP request")
 	return response, nil
 }
 

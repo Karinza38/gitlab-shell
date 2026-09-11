@@ -6,15 +6,13 @@ package githttp
 
 import (
 	"context"
-	"io"
+	"log/slog"
 
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/commandargs"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/readwriter"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/config"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/gitlabnet/accessverifier"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/gitlabnet/git"
-	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/pktline"
-	"gitlab.com/gitlab-org/labkit/log"
 )
 
 const pullService = "git-upload-pack"
@@ -51,8 +49,6 @@ func (c *PullCommand) Execute(ctx context.Context) error {
 
 	// For Git over SSH routing
 	if data.GeoProxyFetchSSHDirectToPrimary {
-		log.ContextLogger(ctx).Info("Using Git over SSH upload pack")
-
 		client.Headers["Git-Protocol"] = c.Args.Env.GitProtocolVersion
 		return c.requestSSHUploadPack(ctx, client)
 	}
@@ -61,63 +57,15 @@ func (c *PullCommand) Execute(ctx context.Context) error {
 		return err
 	}
 
-	return c.requestUploadPack(ctx, client, data.GeoProxyFetchDirectToPrimaryWithOptions)
+	return c.requestUploadPack(ctx, client)
 }
 
 func (c *PullCommand) requestSSHUploadPack(ctx context.Context, client *git.Client) error {
-	response, err := client.SSHUploadPack(ctx, io.NopCloser(c.ReadWriter.In))
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close() //nolint:errcheck
+	slog.InfoContext(ctx, "Using Git over SSH upload pack")
 
-	_, err = io.Copy(c.ReadWriter.Out, response.Body)
-
-	return err
+	return pipeRequest(ctx, c.ReadWriter, readUploadPackRequest, client.SSHUploadPack)
 }
 
-func (c *PullCommand) requestUploadPack(ctx context.Context, client *git.Client, geoProxyFetchDirectToPrimaryWithOptions bool) error {
-	pipeReader, pipeWriter := io.Pipe()
-	go c.readFromStdin(pipeWriter, geoProxyFetchDirectToPrimaryWithOptions)
-
-	response, err := client.UploadPack(ctx, pipeReader)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close() //nolint:errcheck
-
-	_, err = io.Copy(c.ReadWriter.Out, response.Body)
-
-	return err
-}
-
-func (c *PullCommand) readFromStdin(pw *io.PipeWriter, geoProxyFetchDirectToPrimaryWithOptions bool) {
-	scanner := pktline.NewScanner(c.ReadWriter.In)
-
-	for scanner.Scan() {
-		line := scanner.Bytes()
-
-		_, err := pw.Write(line)
-		if err != nil {
-			log.WithError(err).Error("failed to write line")
-		}
-
-		if pktline.IsDone(line) {
-			break
-		}
-
-		if pktline.IsFlush(line) && geoProxyFetchDirectToPrimaryWithOptions {
-			_, err := pw.Write(pktline.PktDone())
-			if err != nil {
-				log.WithError(err).Error("failed to write packet done line")
-			}
-
-			break
-		}
-	}
-
-	err := pw.Close()
-	if err != nil {
-		log.WithError(err).Error("failed to close writer")
-	}
+func (c *PullCommand) requestUploadPack(ctx context.Context, client *git.Client) error {
+	return pipeRequest(ctx, c.ReadWriter, readUploadPackRequest, client.UploadPack)
 }

@@ -3,13 +3,20 @@ package authorizedcerts
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	tspb "gitlab.com/gitlab-org/cells/topology-service/clients/go/proto"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/client"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/client/testserver"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/config"
+	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/topology"
+	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/topology/topologytest"
 )
 
 var (
@@ -94,10 +101,142 @@ func TestGetByKeyErrorResponses(t *testing.T) {
 	}
 }
 
+func TestGetByKeyWithTopologyService(t *testing.T) {
+	t.Run("routes /authorized_certs to cell when TS returns PROXY", func(t *testing.T) {
+		var cellReceived bool
+		cellServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cellReceived = true
+			assert.Contains(t, r.URL.Path, "authorized_certs")
+			assert.Equal(t, "fingerprint-value", r.URL.Query().Get("key"))
+			assert.Equal(t, "user-id", r.URL.Query().Get("user_identifier"))
+			assert.NotEmpty(t, r.Header.Get("Gitlab-Shell-Api-Request"), "JWT header must be present on cell request")
+			assert.NotEmpty(t, r.Header.Get("User-Agent"))
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"username": "root", "namespace": "group"}`)
+		}))
+		t.Cleanup(cellServer.Close)
+
+		var defaultReceived bool
+		defaultServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			defaultReceived = true
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"username": "root", "namespace": "group"}`)
+		}))
+		t.Cleanup(defaultServer.Close)
+
+		cell := topologytest.CellAddressWithBogusPort(t, cellServer, 1)
+
+		mock := &topologytest.MockClassifyServer{
+			Response: &tspb.ClassifyResponse{
+				Action: tspb.ClassifyAction_PROXY,
+				Proxy:  &tspb.ProxyInfo{Address: cell.TopologyAddress},
+			},
+		}
+		tsAddr, tsStop := topologytest.StartMockServer(t, mock)
+		t.Cleanup(tsStop)
+
+		tsClient := topology.NewClient(&topology.Config{
+			Enabled: true,
+			Address: tsAddr,
+			Timeout: 5 * time.Second,
+		})
+		t.Cleanup(func() { _ = tsClient.Close() })
+
+		cfg := &config.Config{
+			GitlabURL:      defaultServer.URL,
+			Secret:         "test-secret",
+			TopologyClient: tsClient,
+			TopologyService: topology.Config{
+				Enabled:      true,
+				CellEndpoint: topology.CellEndpointConfig{Scheme: "http", Port: cell.RealPort},
+			},
+		}
+
+		client, err := NewClient(cfg)
+		require.NoError(t, err)
+
+		result, err := client.GetByKey(context.Background(), "user-id", "fingerprint-value")
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		require.Equal(t, "root", result.Username)
+
+		require.True(t, cellReceived, "request should have been sent to the cell server")
+		require.False(t, defaultReceived, "request should NOT have been sent to the default server")
+
+		require.Equal(t, "fingerprint-value", mock.LastClaim(t).GetSshKeyFingerprint())
+	})
+
+	t.Run("falls back to default", func(t *testing.T) {
+		tests := []struct {
+			name string
+			mock *topologytest.MockClassifyServer // nil means TS not configured
+		}{
+			{
+				name: "when TS is nil",
+				mock: nil,
+			},
+			{
+				name: "when TS returns error",
+				mock: &topologytest.MockClassifyServer{
+					Err: fmt.Errorf("TS unavailable"),
+				},
+			},
+			{
+				name: "when TS returns non-PROXY action",
+				mock: &topologytest.MockClassifyServer{
+					Response: &tspb.ClassifyResponse{
+						Action: tspb.ClassifyAction_ACTION_UNSPECIFIED,
+					},
+				},
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				var defaultReceived bool
+				defaultServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					defaultReceived = true
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprintf(w, `{"username": "root", "namespace": "group"}`)
+				}))
+				t.Cleanup(defaultServer.Close)
+
+				cfg := &config.Config{
+					GitlabURL: defaultServer.URL,
+					Secret:    "test-secret",
+				}
+
+				if tc.mock != nil {
+					tsAddr, tsStop := topologytest.StartMockServer(t, tc.mock)
+					t.Cleanup(tsStop)
+
+					tsClient := topology.NewClient(&topology.Config{
+						Enabled: true,
+						Address: tsAddr,
+						Timeout: 5 * time.Second,
+					})
+					t.Cleanup(func() { _ = tsClient.Close() })
+
+					cfg.TopologyClient = tsClient
+				}
+
+				client, err := NewClient(cfg)
+				require.NoError(t, err)
+
+				result, err := client.GetByKey(context.Background(), "user-id", "fingerprint-value")
+				require.NoError(t, err)
+				require.NotNil(t, result)
+				require.Equal(t, "root", result.Username)
+				require.True(t, defaultReceived, "request should have been sent to the default server")
+			})
+		}
+	})
+}
+
 func setup(t *testing.T) *Client {
 	url := testserver.StartSocketHTTPServer(t, requests)
 
-	client, err := NewClient(&config.Config{GitlabUrl: url})
+	client, err := NewClient(&config.Config{GitlabURL: url})
 	require.NoError(t, err)
 
 	return client

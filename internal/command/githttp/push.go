@@ -2,15 +2,13 @@ package githttp
 
 import (
 	"context"
-	"io"
+	"log/slog"
 
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/commandargs"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/readwriter"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/config"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/gitlabnet/accessverifier"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/gitlabnet/git"
-	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/pktline"
-	"gitlab.com/gitlab-org/labkit/log"
 )
 
 const pushService = "git-receive-pack"
@@ -48,8 +46,6 @@ func (c *PushCommand) Execute(ctx context.Context) error {
 
 	// For Git over SSH routing
 	if data.GeoProxyPushSSHDirectToPrimary {
-		log.ContextLogger(ctx).Info("Using Git over SSH receive pack")
-
 		client.Headers["Git-Protocol"] = c.Args.Env.GitProtocolVersion
 		return c.requestSSHReceivePack(ctx, client)
 	}
@@ -62,61 +58,11 @@ func (c *PushCommand) Execute(ctx context.Context) error {
 }
 
 func (c *PushCommand) requestSSHReceivePack(ctx context.Context, client *git.Client) error {
-	response, err := client.SSHReceivePack(ctx, io.NopCloser(c.ReadWriter.In))
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close() //nolint:errcheck
+	slog.InfoContext(ctx, "Using Git over SSH receive pack")
 
-	_, err = io.Copy(c.ReadWriter.Out, response.Body)
-
-	return err
+	return executeSSHRequest(ctx, client.SSHReceivePack, c.ReadWriter)
 }
 
 func (c *PushCommand) requestReceivePack(ctx context.Context, client *git.Client) error {
-	pipeReader, pipeWriter := io.Pipe()
-	go c.readFromStdin(pipeWriter)
-
-	response, err := client.ReceivePack(ctx, pipeReader)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close() //nolint:errcheck
-
-	_, err = io.Copy(c.ReadWriter.Out, response.Body)
-
-	return err
-}
-
-func (c *PushCommand) readFromStdin(pw *io.PipeWriter) {
-	var needsPackData bool
-
-	scanner := pktline.NewScanner(c.ReadWriter.In)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		_, err := pw.Write(line)
-		if err != nil {
-			log.WithError(err).Error("failed to write line")
-		}
-
-		if pktline.IsFlush(line) {
-			break
-		}
-
-		if !needsPackData && !pktline.IsRefRemoval(line) {
-			needsPackData = true
-		}
-	}
-
-	if needsPackData {
-		_, err := io.Copy(pw, c.ReadWriter.In)
-		if err != nil {
-			log.WithError(err).Error("failed to copy")
-		}
-	}
-
-	err := pw.Close()
-	if err != nil {
-		log.WithError(err).Error("failed to close writer")
-	}
+	return pipeRequest(ctx, c.ReadWriter, readReceivePackRequest, client.ReceivePack)
 }

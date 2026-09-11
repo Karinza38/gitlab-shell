@@ -10,7 +10,6 @@ import (
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/githttp"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/readwriter"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/shared/accessverifier"
-	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/shared/customaction"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/shared/disallowedcommand"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/config"
 )
@@ -44,28 +43,21 @@ func (c *Command) Execute(ctx context.Context) (context.Context, error) {
 		response.RootNamespaceID,
 	))
 
+	if response.IsCellRouted() {
+		return ctxWithLogData, githttp.NewCellsPushCommand(c.Config, c.ReadWriter, c.Args, response).Execute(ctx)
+	}
+
 	if response.IsCustomAction() {
-		// When `geo_proxy_direct_to_primary` feature flag is enabled, a Git over HTTP direct request
-		// to primary repo is performed instead of proxying the request through Gitlab Rails.
-		// After the feature flag is enabled by default and removed,
-		// custom action functionality will be removed along with it.
-		if response.Payload.Data.GeoProxyDirectToPrimary {
-			cmd := githttp.PushCommand{
-				Config:     c.Config,
-				ReadWriter: c.ReadWriter,
-				Response:   response,
-				Args:       c.Args,
-			}
-
-			return ctxWithLogData, cmd.Execute(ctx)
-		}
-
-		customAction := customaction.Command{
+		// A Git over HTTP direct request to primary repo is performed
+		// (instead of formerly proxying the request through Gitlab Rails).
+		cmd := githttp.PushCommand{
 			Config:     c.Config,
 			ReadWriter: c.ReadWriter,
-			EOFSent:    true,
+			Response:   response,
+			Args:       c.Args,
 		}
-		return ctxWithLogData, customAction.Execute(ctx, response)
+
+		return ctxWithLogData, cmd.Execute(ctx)
 	}
 
 	err = c.performGitalyCall(ctx, response)
@@ -74,7 +66,7 @@ func (c *Command) Execute(ctx context.Context) (context.Context, error) {
 	}
 
 	if response.NeedAudit {
-		gitauditevent.Audit(ctx, c.Args.CommandType, c.Config, response, nil /* keep nil for `git-receive-pack`*/)
+		gitauditevent.Audit(ctx, c.Args, c.Config, response, nil /* keep nil for `git-receive-pack`*/)
 	}
 	return ctxWithLogData, nil
 }

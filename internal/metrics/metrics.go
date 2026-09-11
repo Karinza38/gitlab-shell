@@ -10,10 +10,11 @@ import (
 )
 
 const (
-	namespace       = "gitlab_shell"
-	sshdSubsystem   = "sshd"
-	httpSubsystem   = "http"
-	gitalySubsystem = "gitaly"
+	namespace         = "gitlab_shell"
+	sshdSubsystem     = "sshd"
+	httpSubsystem     = "http"
+	gitalySubsystem   = "gitaly"
+	topologySubsystem = "topology"
 
 	httpInFlightRequestsMetricName       = "in_flight_requests"
 	httpRequestsTotalMetricName          = "requests_total"
@@ -23,15 +24,19 @@ const (
 	sshdHitMaxSessionsName                    = "concurrent_limited_sessions_total"
 	sshdSessionDurationSecondsName            = "session_duration_seconds"
 	sshdSessionEstablishedDurationSecondsName = "session_established_duration_seconds"
-	sshdCanceledSessionsName                  = "canceled_sessions"
 
 	sliSshdSessionsTotalName       = "gitlab_sli:shell_sshd_sessions:total"
 	sliSshdSessionsErrorsTotalName = "gitlab_sli:shell_sshd_sessions:errors_total"
 
+	sliSshdConnectionsTotalName       = "gitlab_sli:shell_sshd_connections:total"
+	sliSshdConnectionsErrorsTotalName = "gitlab_sli:shell_sshd_connections:errors_total"
+
 	lfsHTTPConnectionsTotalName = "lfs_http_connections_total"
 	lfsSSHConnectionsTotalName  = "lfs_ssh_connections_total"
 
-	gitalyConnectionsTotalName = "connections_total"
+	connectionsTotalName = "connections_total"
+
+	statusLabel = "status"
 )
 
 var (
@@ -101,15 +106,38 @@ var (
 		},
 	)
 
+	// SliSshdConnectionsTotal is the number of SSH connections that reached
+	// authentication. Unlike SliSshdSessionsTotal (which counts post-auth session
+	// channels), this counts once per connection that attempted to authenticate,
+	// so it captures the full user-facing attempt and excludes connections that
+	// never got past the transport handshake (port scanners, health checks).
+	SliSshdConnectionsTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: sliSshdConnectionsTotalName,
+			Help: "Number of SSH connections that reached authentication",
+		},
+	)
+
+	// SliSshdConnectionsErrorsTotal is the number of SSH connections that failed
+	// due to a server-side error (internal API / transport failure) at either the
+	// authentication or session phase, as opposed to an expected client-side
+	// failure. Counted at most once per connection.
+	SliSshdConnectionsErrorsTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: sliSshdConnectionsErrorsTotalName,
+			Help: "Number of SSH connections that failed due to a server-side error",
+		},
+	)
+
 	// GitalyConnectionsTotal is a counter for the number of Gitaly connections that have been established,
 	GitalyConnectionsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: gitalySubsystem,
-			Name:      gitalyConnectionsTotalName,
+			Name:      connectionsTotalName,
 			Help:      "Number of Gitaly connections that have been established",
 		},
-		[]string{"status"},
+		[]string{statusLabel},
 	)
 
 	// The metrics and the buckets size are similar to the ones we have for handlers in Labkit
@@ -168,6 +196,48 @@ var (
 		prometheus.CounterOpts{
 			Name: lfsSSHConnectionsTotalName,
 			Help: "Number of LFS over SSH connections that have been established",
+		},
+	)
+
+	// TopologyConnectionsTotal is the number of Topology Service connections that have been established.
+	TopologyConnectionsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: topologySubsystem,
+			Name:      connectionsTotalName,
+			Help:      "Number of Topology Service connections that have been established",
+		},
+		[]string{statusLabel},
+	)
+
+	// TopologyRequestsTotal is the number of Topology Service Classify requests.
+	TopologyRequestsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: topologySubsystem,
+			Name:      httpRequestsTotalMetricName,
+			Help:      "Number of Topology Service Classify requests",
+		},
+		[]string{statusLabel},
+	)
+
+	// TopologyRequestDurationSeconds is a histogram of latencies for Topology Service Classify requests.
+	TopologyRequestDurationSeconds = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: namespace,
+			Subsystem: topologySubsystem,
+			Name:      httpRequestDurationSecondsMetricName,
+			Help:      "A histogram of latencies for Topology Service Classify requests",
+			Buckets: []float64{
+				0.005, /* 5ms */
+				0.01,  /* 10ms */
+				0.025, /* 25ms */
+				0.05,  /* 50ms */
+				0.1,   /* 100ms */
+				0.25,  /* 250ms */
+				0.5,   /* 500ms */
+				1.0,   /* 1s */
+			},
 		},
 	)
 )

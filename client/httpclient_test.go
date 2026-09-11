@@ -30,6 +30,46 @@ const (
 	password = "basic_auth_password"
 )
 
+func TestIsFollowedRedirect(t *testing.T) {
+	for code, want := range map[int]bool{
+		http.StatusOK:                false,
+		http.StatusMultipleChoices:   false, // 300: Geo custom action, must be parsed
+		http.StatusMovedPermanently:  true,  // 301
+		http.StatusFound:             true,  // 302
+		http.StatusSeeOther:          true,  // 303
+		http.StatusNotModified:       false, // 304: Go does not follow
+		http.StatusTemporaryRedirect: true,  // 307
+		http.StatusPermanentRedirect: true,  // 308
+		http.StatusNotFound:          false,
+	} {
+		require.Equalf(t, want, IsFollowedRedirect(code), "status %d", code)
+	}
+}
+
+func TestIsSystemErrorStatus(t *testing.T) {
+	for code, want := range map[int]bool{
+		http.StatusOK:                  false, // 200
+		http.StatusNoContent:           false, // 204
+		http.StatusMultipleChoices:     false, // 300: Geo custom action, must be parsed
+		http.StatusMovedPermanently:    true,  // 301
+		http.StatusFound:               true,  // 302
+		http.StatusSeeOther:            true,  // 303
+		http.StatusNotModified:         false, // 304: Go does not follow
+		http.StatusTemporaryRedirect:   true,  // 307
+		http.StatusPermanentRedirect:   true,  // 308
+		http.StatusBadRequest:          true,  // 400: malformed request from shell → system
+		http.StatusUnauthorized:        false, // 401
+		http.StatusForbidden:           false, // 403
+		http.StatusNotFound:            false, // 404
+		http.StatusTooManyRequests:     false, // 429
+		http.StatusInternalServerError: true,  // 500
+		http.StatusBadGateway:          true,  // 502
+		http.StatusServiceUnavailable:  true,  // 503
+	} {
+		require.Equalf(t, want, IsSystemErrorStatus(code), "status %d", code)
+	}
+}
+
 func TestBasicAuthSettings(t *testing.T) {
 	requests := []testserver.TestRequestHandler{
 		{
@@ -83,7 +123,7 @@ func TestEmptyBasicAuthSettings(t *testing.T) {
 		{
 			Path: "/api/v4/internal/empty_basic_auth",
 			Handler: func(_ http.ResponseWriter, r *http.Request) {
-				assert.Equal(t, "", r.Header.Get("Authorization"))
+				assert.Empty(t, r.Header.Get("Authorization"))
 			},
 		},
 	}

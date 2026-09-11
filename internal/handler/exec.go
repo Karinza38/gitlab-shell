@@ -3,7 +3,8 @@ package handler
 
 import (
 	"context"
-	"fmt"
+	"encoding/json"
+	"log/slog"
 	"strconv"
 	"strings"
 
@@ -11,14 +12,17 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 
+	gitalyclient "gitlab.com/gitlab-org/gitaly/v18/client"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/config"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/gitaly"
+	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/gitlabnet"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/gitlabnet/accessverifier"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/sshenv"
+	"gitlab.com/gitlab-org/labkit/v2/log"
 
-	pb "gitlab.com/gitlab-org/gitaly/v16/proto/go/gitalypb"
-	"gitlab.com/gitlab-org/labkit/log"
+	pb "gitlab.com/gitlab-org/gitaly/v18/proto/go/gitalypb"
 )
 
 // GitalyHandlerFunc implementations are responsible for making
@@ -36,12 +40,29 @@ type GitalyCommand struct {
 // NewGitalyCommand creates a new GitalyCommand instance
 func NewGitalyCommand(cfg *config.Config, serviceName string, response *accessverifier.Response) *GitalyCommand {
 	gc := gitaly.Command{
-		ServiceName: serviceName,
-		Address:     response.Gitaly.Address,
-		Token:       response.Gitaly.Token,
+		CacheKey: gitaly.CacheKey{
+			ServiceName: serviceName,
+			Address:     response.Gitaly.Address,
+			Token:       response.Gitaly.Token,
+		},
+		RetryPolicy: parseRetryConfig(response.RetryConfig),
 	}
 
 	return &GitalyCommand{Config: cfg, Response: response, Command: gc}
+}
+
+func parseRetryConfig(rawConfig json.RawMessage) *gitalyclient.RetryPolicy {
+	if len(rawConfig) == 0 {
+		return nil
+	}
+
+	var policy gitalyclient.RetryPolicy
+	if err := protojson.Unmarshal(rawConfig, &policy); err != nil {
+		slog.Default().Error("failed to unmarshal retry policy", log.ErrorMessage(err.Error()))
+		return nil
+	}
+
+	return &policy
 }
 
 // processGitalyError handles errors that come back from Gitaly that may be a
@@ -68,17 +89,15 @@ func (gc *GitalyCommand) RunGitalyCommand(ctx context.Context, handler GitalyHan
 	// We leave the connection open for future reuse
 	conn, err := gc.getConn(ctx)
 	if err != nil {
-		log.ContextLogger(ctx).WithError(fmt.Errorf("RunGitalyCommand: %v", err)).Error("Failed to get connection to execute Git command")
-
+		log.FromContext(ctx).ErrorContext(ctx, "Failed to get connection to execute Git command", log.ErrorMessage(err.Error()))
 		return err
 	}
 
 	childCtx := withOutgoingMetadata(ctx, gc.Response.Gitaly.Features)
-	ctxlog := log.ContextLogger(childCtx)
 	exitStatus, err := handler(childCtx, conn)
 
 	if err != nil {
-		ctxlog.WithError(err).WithFields(log.Fields{"exit_status": exitStatus}).Error("Failed to execute Git command")
+		log.FromContext(ctx).ErrorContext(ctx, "Failed to execute Git command", log.ErrorMessage(err.Error()), slog.Int("exit_status", int(exitStatus)))
 
 		if grpcstatus.Code(err) == grpccodes.Unavailable {
 			return processGitalyError(err)
@@ -110,19 +129,25 @@ func (gc *GitalyCommand) PrepareContext(ctx context.Context, repository *pb.Repo
 
 // LogExecution logs the execution of a Git command
 func (gc *GitalyCommand) LogExecution(ctx context.Context, repository *pb.Repository, env sshenv.Env) {
-	fields := log.Fields{
-		"command":         gc.Command.ServiceName,
-		"gl_project_path": repository.GlProjectPath,
-		"gl_repository":   repository.GlRepository,
-		"user_id":         gc.Response.UserID,
-		"username":        gc.Response.Username,
-		"git_protocol":    env.GitProtocolVersion,
-		"remote_ip":       env.RemoteAddr,
-		"gl_key_type":     gc.Response.KeyType,
-		"gl_key_id":       gc.Response.KeyID,
+	attrs := []any{
+		slog.String("command", gc.Command.ServiceName),
+		slog.String("gl_project_path", repository.GlProjectPath),
+		slog.String("gl_repository", repository.GlRepository),
+		log.GitLabUserName(gc.Response.Username),
+		slog.String("git_protocol", env.GitProtocolVersion),
+		log.RemoteIP(env.RemoteAddr),
+		slog.String("gl_key_type", gc.Response.KeyType),
+		slog.Int("gl_key_id", gc.Response.KeyID),
 	}
 
-	log.WithContextFields(ctx, fields).Info("executing git command")
+	glID, err := gitlabnet.ParseGlID(gc.Response.UserID)
+	if err != nil {
+		log.FromContext(ctx).WarnContext(ctx, "handler: LogExecution: failed to parse user_id", log.ErrorMessage(err.Error()))
+	} else if userID, ok := glID.UserID(); ok {
+		attrs = append(attrs, log.GitLabUserID(userID))
+	}
+
+	log.FromContext(ctx).InfoContext(ctx, "executing git command", attrs...)
 }
 
 func withOutgoingMetadata(ctx context.Context, features map[string]string) context.Context {

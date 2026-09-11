@@ -4,11 +4,13 @@ package sshd
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 
-	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sync/semaphore"
 	grpccodes "google.golang.org/grpc/codes"
@@ -19,15 +21,38 @@ import (
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/config"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/metrics"
 
-	"gitlab.com/gitlab-org/labkit/log"
+	"gitlab.com/gitlab-org/labkit/v2/log"
 )
 
 const (
 	// KeepAliveMsg is the message used for keeping SSH connections alive.
 	KeepAliveMsg = "keepalive@openssh.com"
 
+	// sessionChannelType is the SSH channel type for interactive sessions.
+	sessionChannelType = "session"
+
 	// NotOurRefError represents the error message indicating that the git upload-pack is not our reference
 	NotOurRefError = `exit status 128, stderr: "fatal: git upload-pack: not our ref `
+
+	// brokenPipeError and copyResponseEOFError are error-message fragments seen
+	// when the client disconnects or aborts a transfer mid-stream. They differ in
+	// how they surface, which is why isClientDisconnect matches them differently:
+	//   - brokenPipeError: the git subprocess is killed by SIGPIPE once its
+	//     output to the SSH client closes; Gitaly reports this as a gRPC Internal
+	//     error, so it is matched only when the code is Internal.
+	//   - copyResponseEOFError: copying the response back to the client fails with
+	//     EOF; this is a plain error at the SSH copy layer with no gRPC code, so
+	//     it is matched regardless of status.
+	// Both are client-side outcomes, not gitlab-shell/Gitaly failures, so they
+	// must not count toward the error SLI.
+	//
+	// Matching on the message detail is a stopgap. The durable fix is for Gitaly
+	// to return Canceled for client disconnects (see the Gitaly issue linked from
+	// https://gitlab.com/gitlab-org/gitlab-shell/-/work_items/863), after which
+	// the existing grpccodes.Canceled check would cover the broken-pipe case and
+	// this match could be simplified.
+	brokenPipeError      = "signal: broken pipe"
+	copyResponseEOFError = "copy response: EOF"
 )
 
 // EOFTimeout specifies the timeout duration for EOF (End of File) in SSH connections
@@ -39,6 +64,46 @@ type connection struct {
 	nconn              net.Conn
 	maxSessions        int64
 	remoteAddr         string
+	outcome            connOutcome
+}
+
+// connOutcome records, for a single connection, whether authentication was
+// attempted and whether any server-side error occurred (at the auth or session
+// phase). It feeds the connection-level SLI emitted once in handle().
+//
+// authAttempted is written only from the auth callback, which ssh.NewServerConn
+// invokes inline on handle()'s goroutine, so it needs no synchronization.
+// serverError may also be written from per-session goroutines, so it is atomic.
+type connOutcome struct {
+	authAttempted bool
+	serverError   atomic.Bool
+}
+
+// observeAuth records the result of a public-key (or certificate) auth attempt.
+// A connection that reaches this point spoke SSH and tried to authenticate, so
+// it counts toward the connection SLI; port scanners and health checks fail the
+// transport handshake earlier and never get here. Only a server-side failure (a
+// System *client.APIError, e.g. the internal API was unreachable or redirected)
+// marks the connection as an error; client-side failures (unknown key) do not.
+func (o *connOutcome) observeAuth(err error) {
+	o.authAttempted = true
+
+	// SSH clients may try several keys in sequence, and the final attempt decides
+	// the connection's fate. A successful attempt means the connection
+	// authenticated, so clear any server-side error recorded by an earlier
+	// attempt (e.g. a transient internal API failure that the next key recovered
+	// from): the connection ultimately succeeded and must not count as an error.
+	// Auth always completes before any session runs, so this never clears a
+	// session-phase error.
+	if err == nil {
+		o.serverError.Store(false)
+		return
+	}
+
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) && apiErr.System {
+		o.serverError.Store(true)
+	}
 }
 
 type channelHandler func(context.Context, *ssh.ServerConn, ssh.Channel, <-chan *ssh.Request) error
@@ -56,7 +121,16 @@ func newConnection(cfg *config.Config, nconn net.Conn) *connection {
 }
 
 func (c *connection) handle(ctx context.Context, srvCfg *ssh.ServerConfig, handler channelHandler) {
-	log.WithContextFields(ctx, log.Fields{}).Info("server: handleConn: start")
+	log.FromContext(ctx).InfoContext(ctx, "server: handleConn: start")
+
+	// Emit the connection-level SLI once, after the full lifecycle (auth + any
+	// sessions) has been observed. handleRequests waits (up to EOFTimeout) for
+	// all sessions to be released, so c.outcome normally reflects the final
+	// verdict. If EOFTimeout fires with a session still in flight, a late session
+	// error may be missed here; that only under-counts errors (never the
+	// denominator) in that rare path, and such late errors are typically context
+	// cancellations, which trackError excludes anyway.
+	defer c.trackConnection()
 
 	sconn, chans, err := c.initServerConn(ctx, srvCfg)
 	if err != nil {
@@ -72,7 +146,9 @@ func (c *connection) handle(ctx context.Context, srvCfg *ssh.ServerConfig, handl
 	c.handleRequests(ctx, sconn, chans, handler)
 
 	reason := sconn.Wait()
-	log.WithContextFields(ctx, log.Fields{"reason": reason}).Info("server: handleConn: done")
+	if reason != nil {
+		log.FromContext(ctx).InfoContext(ctx, "server: handleConn: done", log.ErrorMessage(reason.Error()))
+	}
 }
 
 func (c *connection) initServerConn(ctx context.Context, srvCfg *ssh.ServerConfig) (*ssh.ServerConn, <-chan ssh.NewChannel, error) {
@@ -84,12 +160,12 @@ func (c *connection) initServerConn(ctx context.Context, srvCfg *ssh.ServerConfi
 	sconn, chans, reqs, err := ssh.NewServerConn(c.nconn, srvCfg)
 	if err != nil {
 		msg := "connection: initServerConn: failed to initialize SSH connection"
-		logger := log.WithContextFields(ctx, log.Fields{"remote_addr": c.remoteAddr}).WithError(err)
+		ctx = log.AppendFields(ctx, log.ErrorMessage(err.Error()), slog.String("remote_addr", c.remoteAddr))
 
 		if strings.Contains(err.Error(), "no common algorithm for host key") || err.Error() == "EOF" {
-			logger.Debug(msg)
+			log.FromContext(ctx).DebugContext(ctx, msg)
 		} else {
-			logger.Warn(msg)
+			log.FromContext(ctx).WarnContext(ctx, msg)
 		}
 
 		return nil, nil, err
@@ -100,19 +176,18 @@ func (c *connection) initServerConn(ctx context.Context, srvCfg *ssh.ServerConfi
 }
 
 func (c *connection) handleRequests(ctx context.Context, sconn *ssh.ServerConn, chans <-chan ssh.NewChannel, handler channelHandler) {
-	ctxlog := log.WithContextFields(ctx, log.Fields{"remote_addr": c.remoteAddr})
-
+	requestCtx := log.AppendFields(ctx, slog.String("remote_addr", c.remoteAddr))
 	for newChannel := range chans {
-		ctxlog.WithField("channel_type", newChannel.ChannelType()).Info("connection: handle: new channel requested")
+		log.FromContext(requestCtx).InfoContext(requestCtx, "connection: handle: new channel requested", slog.String("channel_type", newChannel.ChannelType()))
 
-		if newChannel.ChannelType() != "session" {
-			ctxlog.Info("connection: handleRequests: unknown channel type")
+		if newChannel.ChannelType() != sessionChannelType {
+			log.FromContext(requestCtx).InfoContext(requestCtx, "connection: handleRequests: unknown channel type")
 			_ = newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
 			continue
 		}
 
 		if !c.concurrentSessions.TryAcquire(1) {
-			ctxlog.Info("connection: handleRequests: too many concurrent sessions")
+			log.FromContext(requestCtx).InfoContext(requestCtx, "connection: handleRequests: too many concurrent sessions")
 			_ = newChannel.Reject(ssh.ResourceShortage, "too many concurrent sessions")
 			metrics.SshdHitMaxSessions.Inc()
 			continue
@@ -120,16 +195,16 @@ func (c *connection) handleRequests(ctx context.Context, sconn *ssh.ServerConn, 
 
 		channel, requests, err := newChannel.Accept()
 		if err != nil {
-			ctxlog.WithError(err).Error("connection: handleRequests: accepting channel failed")
+			log.FromContext(requestCtx).ErrorContext(requestCtx, "connection: handleRequests: accepting channel failed", log.ErrorMessage(err.Error()))
 			c.concurrentSessions.Release(1)
 			continue
 		}
 
 		go func() {
 			defer func(started time.Time) {
-				duration := time.Since(started).Seconds()
-				metrics.SshdSessionDuration.Observe(duration)
-				ctxlog.WithFields(log.Fields{"duration_s": duration}).Info("connection: handleRequests: done")
+				dur := time.Since(started)
+				metrics.SshdSessionDuration.Observe(dur.Seconds())
+				log.FromContext(requestCtx).InfoContext(requestCtx, "connection: handleRequests: done", log.DurationS(dur))
 			}(time.Now())
 
 			defer c.concurrentSessions.Release(1)
@@ -137,14 +212,14 @@ func (c *connection) handleRequests(ctx context.Context, sconn *ssh.ServerConn, 
 			// Prevent a panic in a single session from taking out the whole server
 			defer func() {
 				if err := recover(); err != nil {
-					ctxlog.WithField("recovered_error", err).Error("panic handling session")
+					log.FromContext(requestCtx).ErrorContext(requestCtx, "panic handling session", slog.Any("recovered_error", err))
 				}
 			}()
 
 			metrics.SliSshdSessionsTotal.Inc()
-			err := handler(ctx, sconn, channel, requests)
+			err := handler(requestCtx, sconn, channel, requests)
 			if err != nil {
-				c.trackError(ctxlog, err)
+				c.trackError(requestCtx, err)
 			}
 		}()
 	}
@@ -159,31 +234,35 @@ func (c *connection) handleRequests(ctx context.Context, sconn *ssh.ServerConn, 
 }
 
 func (c *connection) sendKeepAliveMsg(ctx context.Context, sconn *ssh.ServerConn, ticker *time.Ticker) {
-	ctxlog := log.WithContextFields(ctx, log.Fields{"remote_addr": c.remoteAddr})
+	ctx = log.AppendFields(ctx, slog.String("remote_addr", c.remoteAddr))
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			ctxlog.Debug("connection: sendKeepAliveMsg: send keepalive message to a client")
+			log.FromContext(ctx).DebugContext(ctx, "connection: sendKeepAliveMsg: send keepalive message to a client")
 
 			status, payload, err := sconn.SendRequest(KeepAliveMsg, true, nil)
 			if err != nil {
-				ctxlog.Errorf("Error occurred while sending request :%v", err)
+				log.FromContext(ctx).ErrorContext(ctx, fmt.Sprintf("Error occurred while sending request :%v", err))
 				return
 			}
 
 			if status {
-				ctxlog.Debugf("connection: sendKeepAliveMsg: payload: %v", string(payload))
+				log.FromContext(ctx).DebugContext(ctx, fmt.Sprintf("connection: sendKeepAliveMsg: payload: %v", string(payload)))
 			}
 		}
 	}
 }
 
-func (c *connection) trackError(ctxlog *logrus.Entry, err error) {
+func (c *connection) trackError(ctx context.Context, err error) {
+	// Policy responses from the internal API (e.g. "You are not allowed to
+	// push") are expected outcomes and must not count toward the error SLI.
+	// System/transport failures (unreachable, followed redirect, 400, or 5xx)
+	// indicate a gitlab-shell/infrastructure problem and should.
 	var apiError *client.APIError
-	if errors.As(err, &apiError) {
+	if errors.As(err, &apiError) && !apiError.System {
 		return
 	}
 
@@ -198,6 +277,41 @@ func (c *connection) trackError(ctxlog *logrus.Entry, err error) {
 		return
 	}
 
+	if isClientDisconnect(err.Error(), grpcCode) {
+		return
+	}
+
 	metrics.SliSshdSessionsErrorsTotal.Inc()
-	ctxlog.WithError(err).Warn("connection: session error")
+	// Feed the connection-level SLI: a counted session error is a server-side
+	// failure for this connection. trackConnection (deferred in handle) emits the
+	// connection metrics once, after all sessions have completed.
+	c.outcome.serverError.Store(true)
+	log.FromContext(ctx).WarnContext(ctx, "connection: session error", log.ErrorMessage(err.Error()))
+}
+
+// isClientDisconnect reports whether err represents a client that disconnected
+// or aborted a transfer mid-stream, which is a client-side outcome and must not
+// count toward the error SLI. See the brokenPipeError/copyResponseEOFError
+// constants for why the two fragments are matched differently.
+func isClientDisconnect(msg string, grpcCode grpccodes.Code) bool {
+	if grpcCode == grpccodes.Internal && strings.Contains(msg, brokenPipeError) {
+		return true
+	}
+
+	return strings.Contains(msg, copyResponseEOFError)
+}
+
+// trackConnection emits the connection-level SLI once per connection. Only
+// connections that reached authentication are counted, which excludes port
+// scanners, TCP health checks, and protocol-mismatch clients that fail the
+// transport handshake before any authentication attempt.
+func (c *connection) trackConnection() {
+	if !c.outcome.authAttempted {
+		return
+	}
+
+	metrics.SliSshdConnectionsTotal.Inc()
+	if c.outcome.serverError.Load() {
+		metrics.SliSshdConnectionsErrorsTotal.Inc()
+	}
 }

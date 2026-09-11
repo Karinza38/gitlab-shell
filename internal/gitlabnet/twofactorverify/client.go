@@ -12,12 +12,14 @@ import (
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/config"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/gitlabnet"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/gitlabnet/discover"
+	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/topology"
 )
 
 // Client represents a client for interacting with the two-factor verification API.
 type Client struct {
-	config *config.Config
-	client *client.GitlabNetClient
+	config   *config.Config
+	client   *client.GitlabNetClient
+	resolver *topology.Resolver
 }
 
 // Response represents the response from the two-factor verification API.
@@ -40,7 +42,11 @@ func NewClient(config *config.Config) (*Client, error) {
 		return nil, fmt.Errorf("error creating http client: %v", err)
 	}
 
-	return &Client{config: config, client: client}, nil
+	return &Client{
+		config:   config,
+		client:   client,
+		resolver: config.NewTopologyResolver(),
+	}, nil
 }
 
 // VerifyOTP verifies the one-time password (OTP) for two-factor authentication.
@@ -50,7 +56,8 @@ func (c *Client) VerifyOTP(ctx context.Context, args *commandargs.Shell, otp str
 		return err
 	}
 
-	response, err := c.client.Post(ctx, "/two_factor_manual_otp_check", requestBody)
+	routed := c.resolver.ClientForUserArgs(ctx, c.client, args.UserArgs())
+	response, err := routed.Client.Post(ctx, "/two_factor_manual_otp_check", requestBody)
 	if err != nil {
 		return err
 	}
@@ -66,7 +73,8 @@ func (c *Client) PushAuth(ctx context.Context, args *commandargs.Shell) error {
 		return err
 	}
 
-	response, err := c.client.Post(ctx, "/two_factor_push_otp_check", requestBody)
+	routed := c.resolver.ClientForUserArgs(ctx, c.client, args.UserArgs())
+	response, err := routed.Client.Post(ctx, "/two_factor_push_otp_check", requestBody)
 	if err != nil {
 		return err
 	}

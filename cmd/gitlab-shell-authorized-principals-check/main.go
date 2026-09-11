@@ -45,9 +45,12 @@ func run() int {
 		_, _ = fmt.Fprintln(readWriter.ErrOut, "Failed to read config, exiting:", err)
 		return 1
 	}
+	defer config.Close() //nolint:errcheck
 
-	logCloser := logger.Configure(config)
-	defer logCloser.Close() //nolint:errcheck
+	logCloser := logger.ConfigureLogger(config)
+	if logCloser != nil {
+		defer logCloser.Close() //nolint:errcheck
+	}
 
 	cmd, err := cmd.New(os.Args[1:], config, readWriter)
 	if err != nil {

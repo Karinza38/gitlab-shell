@@ -4,10 +4,11 @@ package git
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
 
 	"gitlab.com/gitlab-org/gitlab-shell/v14/client"
-	"gitlab.com/gitlab-org/labkit/log"
+	"gitlab.com/gitlab-org/labkit/v2/log"
 )
 
 var httpClient = &http.Client{
@@ -85,7 +86,7 @@ func (c *Client) do(request *http.Request) (*http.Response, error) {
 		request.Header.Add(k, v)
 	}
 
-	response, err := httpClient.Do(request)
+	response, err := httpClient.Do(request) // #nosec G704 -- URL is constructed from configured GitLab internal API
 	if err != nil {
 		return nil, &client.APIError{Msg: repoUnavailableErrMsg}
 	}
@@ -93,7 +94,7 @@ func (c *Client) do(request *http.Request) (*http.Response, error) {
 	if response.StatusCode >= 400 {
 		defer func() {
 			if err := response.Body.Close(); err != nil {
-				log.WithError(err).Error("Unable to close response body")
+				slog.ErrorContext(request.Context(), "Unable to close response body", log.ErrorMessage(err.Error()))
 			}
 		}()
 

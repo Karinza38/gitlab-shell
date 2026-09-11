@@ -31,7 +31,7 @@ func TestExecute(t *testing.T) {
 	output := &bytes.Buffer{}
 
 	cmd := &PushCommand{
-		Config:     &config.Config{GitlabUrl: url},
+		Config:     &config.Config{GitlabURL: url},
 		ReadWriter: &readwriter.ReadWriter{Out: output, In: input},
 		Response: &accessverifier.Response{
 			Payload: accessverifier.CustomPayload{
@@ -63,7 +63,7 @@ func TestExecuteWithFailedInfoRefs(t *testing.T) {
 		}, {
 			desc:            "unexpected response",
 			statusCode:      http.StatusOK,
-			responseContent: "unexpected response",
+			responseContent: testUnexpectedResponse,
 			expectedErr:     "unexpected git-receive-pack response",
 		},
 	}
@@ -72,7 +72,7 @@ func TestExecuteWithFailedInfoRefs(t *testing.T) {
 		t.Run(tc.desc, func(t *testing.T) {
 			requests := []testserver.TestRequestHandler{
 				{
-					Path: "/info/refs",
+					Path: testInfoRefsPath,
 					Handler: func(w http.ResponseWriter, r *http.Request) {
 						assert.Equal(t, "git-receive-pack", r.URL.Query().Get("service"))
 
@@ -85,7 +85,7 @@ func TestExecuteWithFailedInfoRefs(t *testing.T) {
 			url := testserver.StartHTTPServer(t, requests)
 
 			cmd := &PushCommand{
-				Config: &config.Config{GitlabUrl: url},
+				Config: &config.Config{GitlabURL: url},
 				Response: &accessverifier.Response{
 					Payload: accessverifier.CustomPayload{
 						Data: accessverifier.CustomPayloadData{PrimaryRepo: url},
@@ -105,7 +105,7 @@ func TestExecuteWithFailedReceivePack(t *testing.T) {
 	output := &bytes.Buffer{}
 
 	cmd := &PushCommand{
-		Config:     &config.Config{GitlabUrl: url},
+		Config:     &config.Config{GitlabURL: url},
 		ReadWriter: &readwriter.ReadWriter{Out: output, In: input},
 		Response: &accessverifier.Response{
 			Payload: accessverifier.CustomPayload{
@@ -125,21 +125,20 @@ func TestPushExecuteWithSSHReceivePack(t *testing.T) {
 	input := strings.NewReader(cloneResponse + "0009done\n")
 
 	cmd := &PushCommand{
-		Config:     &config.Config{GitlabUrl: url},
+		Config:     &config.Config{GitlabURL: url},
 		ReadWriter: &readwriter.ReadWriter{Out: output, In: input},
 		Response: &accessverifier.Response{
 			Payload: accessverifier.CustomPayload{
 				Data: accessverifier.CustomPayloadData{
 					PrimaryRepo:                    url,
-					GeoProxyDirectToPrimary:        true,
 					GeoProxyPushSSHDirectToPrimary: true,
-					RequestHeaders:                 map[string]string{"Authorization": "token"},
+					RequestHeaders:                 map[string]string{"Authorization": testGitalyToken},
 				},
 			},
 		},
 		Args: &commandargs.Shell{
 			Env: sshenv.Env{
-				GitProtocolVersion: "version=2",
+				GitProtocolVersion: testGitProtocolVersion,
 			},
 		},
 	}
@@ -163,7 +162,7 @@ func setup(t *testing.T, receivePackStatusCode int) (string, io.Reader) {
 
 	requests := []testserver.TestRequestHandler{
 		{
-			Path: "/info/refs",
+			Path: testInfoRefsPath,
 			Handler: func(w http.ResponseWriter, r *http.Request) {
 				assert.Equal(t, "git-receive-pack", r.URL.Query().Get("service"))
 
@@ -196,8 +195,8 @@ func setupSSHPush(t *testing.T, uploadPackStatusCode int) string {
 				defer r.Body.Close()
 
 				assert.True(t, strings.HasSuffix(string(body), "0009done\n"))
-				assert.Equal(t, "version=2", r.Header.Get("Git-Protocol"))
-				assert.Equal(t, "token", r.Header.Get("Authorization"))
+				assert.Equal(t, testGitProtocolVersion, r.Header.Get("Git-Protocol"))
+				assert.Equal(t, testGitalyToken, r.Header.Get("Authorization"))
 
 				w.WriteHeader(uploadPackStatusCode)
 				w.Write([]byte("receive-pack-response"))

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"log/slog"
 
 	"github.com/charmbracelet/git-lfs-transfer/transfer"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command"
@@ -13,7 +14,7 @@ import (
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/shared/disallowedcommand"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/config"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/gitlabnet/lfsauthenticate"
-	"gitlab.com/gitlab-org/labkit/log"
+	"gitlab.com/gitlab-org/labkit/v2/log"
 )
 
 var (
@@ -23,12 +24,14 @@ var (
 	}
 )
 
+// Command handles git-lfs-transfer operations
 type Command struct {
 	Config     *config.Config
 	Args       *commandargs.Shell
 	ReadWriter *readwriter.ReadWriter
 }
 
+// Execute runs the git-lfs-transfer command
 func (c *Command) Execute(ctx context.Context) (context.Context, error) {
 	args := c.Args.SSHArgs
 	if len(args) != 3 {
@@ -49,50 +52,62 @@ func (c *Command) Execute(ctx context.Context) (context.Context, error) {
 		return ctx, err
 	}
 
-	ctxWithLogData := context.WithValue(ctx, "logData", command.NewLogData(
+	ctxWithLogData := context.WithValue(ctx, command.LogDataKey, command.NewLogData(
 		accessResponse.Gitaly.Repo.GlProjectPath,
 		accessResponse.Username,
 		accessResponse.ProjectID,
 		accessResponse.RootNamespaceID,
 	))
 
-	log.WithContextFields(ctxWithLogData, log.Fields{"action": action}).Info("processing action")
-
-	auth, err := c.authenticate(ctx, operation, repo, accessResponse.UserID)
+	slog.InfoContext(ctxWithLogData, "processing action", slog.Any("action", action))
+	auth, err := c.authenticate(ctx, operation, repo, accessResponse.UserID, accessResponse.CellAddress)
 	if err != nil {
 		return ctxWithLogData, err
 	}
 
-	logger := NewWrappedLoggerForGitLFSTransfer(ctxWithLogData)
+	return c.processTransfer(ctxWithLogData, operation, action, auth)
+}
 
-	backend, err := NewGitlabBackend(ctxWithLogData, c.Config, c.Args, auth)
+func (c *Command) processTransfer(ctx context.Context, operation string, action commandargs.CommandType, auth *GitlabAuthentication) (context.Context, error) {
+	logger := NewWrappedLoggerForGitLFSTransfer(ctx)
+
+	backend, err := NewGitlabBackend(ctx, c.Config, c.Args, auth)
 	if err != nil {
-		return ctxWithLogData, err
+		return ctx, err
 	}
 
 	handler := transfer.NewPktline(c.ReadWriter.In, c.ReadWriter.Out, logger)
 
+	if err := c.sendCapabilities(ctx, handler); err != nil {
+		return ctx, err
+	}
+
+	p := transfer.NewProcessor(handler, backend, logger)
+	defer slog.InfoContext(ctx, "done processing commands", slog.Any("action", action))
+
+	switch operation {
+	case transfer.DownloadOperation:
+		return ctx, p.ProcessCommands(transfer.DownloadOperation)
+	case transfer.UploadOperation:
+		return ctx, p.ProcessCommands(transfer.UploadOperation)
+	default:
+		return ctx, fmt.Errorf("unknown operation %q", operation)
+	}
+}
+
+func (c *Command) sendCapabilities(ctx context.Context, handler *transfer.Pktline) error {
 	for _, cap := range capabilities {
 		if err := handler.WritePacketText(cap); err != nil {
-			log.WithContextFields(ctxWithLogData, log.Fields{"capability": cap}).WithError(err).Error("error sending capability")
+			slog.ErrorContext(ctx, "error sending capability", log.ErrorMessage(err.Error()), slog.String("capability", cap))
 		}
 	}
 
 	if err := handler.WriteFlush(); err != nil {
-		log.WithContextFields(ctxWithLogData, log.Fields{}).WithError(err).Error("error flushing capabilities")
+		slog.ErrorContext(ctx, "error flushing capabilities", log.ErrorMessage(err.Error()))
+		return err
 	}
 
-	p := transfer.NewProcessor(handler, backend, logger)
-	defer log.WithContextFields(ctxWithLogData, log.Fields{"action": action}).Info("done processing commands")
-
-	switch operation {
-	case transfer.DownloadOperation:
-		return ctxWithLogData, p.ProcessCommands(transfer.DownloadOperation)
-	case transfer.UploadOperation:
-		return ctxWithLogData, p.ProcessCommands(transfer.UploadOperation)
-	default:
-		return ctxWithLogData, fmt.Errorf("unknown operation %q", operation)
-	}
+	return nil
 }
 
 func actionFromOperation(operation string) (commandargs.CommandType, error) {
@@ -111,18 +126,22 @@ func actionFromOperation(operation string) (commandargs.CommandType, error) {
 }
 
 func (c *Command) verifyAccess(ctx context.Context, action commandargs.CommandType, repo string) (*accessverifier.Response, error) {
-	cmd := accessverifier.Command{c.Config, c.Args, c.ReadWriter}
+	cmd := accessverifier.Command{
+		Config:     c.Config,
+		Args:       c.Args,
+		ReadWriter: c.ReadWriter,
+	}
 
 	return cmd.Verify(ctx, action, repo)
 }
 
-func (c *Command) authenticate(ctx context.Context, operation string, repo string, userID string) (*GitlabAuthentication, error) {
+func (c *Command) authenticate(ctx context.Context, operation string, repo string, userID string, cellAddress string) (*GitlabAuthentication, error) {
 	client, err := lfsauthenticate.NewClient(c.Config, c.Args)
 	if err != nil {
 		return nil, err
 	}
 
-	response, err := client.Authenticate(ctx, operation, repo, userID)
+	response, err := client.Authenticate(ctx, operation, repo, userID, cellAddress)
 	if err != nil {
 		return nil, err
 	}

@@ -3,13 +3,17 @@
 package commandargs
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 
 	"github.com/mattn/go-shellwords"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/sshenv"
+	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/topology"
 )
+
+const gitCommand = "git"
 
 // Define supported command types
 const (
@@ -31,6 +35,12 @@ var (
 
 	// List of Git commands that are handled in a special way
 	GitCommands = []CommandType{LfsAuthenticate, UploadPack, ReceivePack, UploadArchive}
+)
+
+var (
+	// ErrOnlySSHAllowed - represents the error returned when the
+	// a non ssh connection is passed.
+	ErrOnlySSHAllowed = errors.New("Only SSH allowed") //nolint:staticcheck // message is customer facing
 )
 
 // Shell represents a parsed shell command with its arguments and related information.
@@ -60,13 +70,24 @@ func (s *Shell) GetArguments() []string {
 	return s.Arguments
 }
 
+// UserArgs returns the topology.UserArgs for this shell session's identity fields.
+// This centralizes the mapping from Shell identity fields to the topology
+// resolution parameters, so callers don't need to construct UserArgs inline.
+func (s *Shell) UserArgs() topology.UserArgs {
+	return topology.UserArgs{
+		Username:      s.GitlabUsername,
+		KeyID:         s.GitlabKeyID,
+		Krb5Principal: s.GitlabKrb5Principal,
+	}
+}
+
 func (s *Shell) validate() error {
 	if !s.Env.IsSSHConnection {
-		return fmt.Errorf("Only SSH allowed") //nolint:stylecheck //message is customer facing
+		return ErrOnlySSHAllowed //nolint:staticcheck // message is customer facing
 	}
 
 	if err := s.ParseCommand(s.Env.OriginalCommand); err != nil {
-		return fmt.Errorf("Invalid SSH command: %w", err) //nolint:stylecheck //message is customer facing
+		return fmt.Errorf("Invalid SSH command: %w", err) //nolint:staticcheck // message is customer facing
 	}
 
 	return nil
@@ -119,7 +140,7 @@ func (s *Shell) ParseCommand(commandString string) error {
 	}
 
 	// Handle Git for Windows 2.14 using "git upload-pack" instead of git-upload-pack
-	if len(args) > 1 && args[0] == "git" {
+	if len(args) > 1 && args[0] == gitCommand {
 		command := args[0] + "-" + args[1]
 		commandArgs := args[2:]
 

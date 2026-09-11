@@ -6,12 +6,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
-
-	"gitlab.com/gitlab-org/labkit/log"
 
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/commandargs"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/readwriter"
@@ -45,9 +44,8 @@ func (c *Command) Execute(ctx context.Context) (context.Context, error) {
 		return ctx, err
 	}
 
-	log.WithContextFields(ctx, log.Fields{
-		"token_args": c.TokenArgs,
-	}).Info("personalaccesstoken: execute: requesting token")
+	slog.InfoContext(ctx, "personalaccesstoken: execute: requesting token",
+		slog.Any("token_args", c.TokenArgs))
 
 	response, err := c.getPersonalAccessToken(ctx)
 	if err != nil {
@@ -63,7 +61,7 @@ func (c *Command) Execute(ctx context.Context) (context.Context, error) {
 
 func (c *Command) parseTokenArgs() error {
 	if len(c.Args.SSHArgs) < 3 || len(c.Args.SSHArgs) > 4 {
-		return errors.New(usageText) // nolint:stylecheck // usageText is customer facing
+		return errors.New(usageText) //nolint:staticcheck // usageText is customer facing
 	}
 
 	var rectfiedScopes []string
@@ -90,7 +88,7 @@ func (c *Command) parseTokenArgs() error {
 
 	TTL, err := strconv.Atoi(rawTTL)
 	if err != nil || TTL < 0 {
-		return fmt.Errorf("Invalid value for days_ttl: '%s'", rawTTL) //nolint:stylecheck //message is customer facing
+		return fmt.Errorf("Invalid value for days_ttl: '%s'", rawTTL) //nolint:staticcheck // message is customer facing
 	}
 
 	c.TokenArgs.ExpiresDate = time.Now().AddDate(0, 0, TTL+1).Format(expiresDateFormat)

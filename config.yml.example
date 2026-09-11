@@ -51,7 +51,7 @@ auth_file: "/home/git/.ssh/authorized_keys"
 log_level: INFO
 
 # Log format. 'json' by default, can be changed to 'text' if needed
-# log_format: json
+log_format: text
 
 # Audit usernames.
 # Set to true to see real usernames in the logs instead of key ids, which is easier to follow, but
@@ -109,6 +109,13 @@ sshd:
     - /run/secrets/ssh-hostkeys/ssh_host_rsa_key-cert.pub
     - /run/secrets/ssh-hostkeys/ssh_host_ecdsa_key-cert.pub
     - /run/secrets/ssh-hostkeys/ssh_host_ed25519_key-cert.pub
+  # Trusted user CA public keys for instance-level SSH certificate authentication.
+  # Certificates signed by these CAs will be trusted for authentication.
+  # The certificate's KeyId must contain the GitLab username.
+  # This is the gitlab-sshd equivalent of OpenSSH's TrustedUserCAKeys directive.
+  # Example: ssh-keygen -s /path/to/ca -I <gitlab-username> -V +1d user-key.pub
+  # trusted_user_ca_keys:
+  #   - /etc/gitlab/ssh_user_ca.pub
   # GSSAPI-related settings
   gssapi:
     # Enable the gssapi-with-mic authentication method. Defaults to false.
@@ -128,3 +135,39 @@ pat:
   enabled: true
   # Configure which PAT scopes are allowable to generate using an SSH key
   # allowed_scopes: [read_repository]
+
+# Topology Service configuration for GitLab Cells routing.
+# This enables routing SSH requests to the appropriate cell in a multi-cell deployment.
+# See: https://handbook.gitlab.com/handbook/engineering/architecture/design-documents/cells/topology_service/
+#
+# topology_service:
+#   # Enable Topology Service integration
+#   enabled: false
+#
+#   # gRPC address of the Topology Service
+#   address: "topology.gitlab.com:443"
+#
+#   # Timeout for Topology Service requests. Defaults to 5s.
+#   timeout: 5s
+#
+#   # TLS configuration for secure connections
+#   tls:
+#     # Enable TLS (recommended for production)
+#     enabled: true
+#     # Path to CA certificate file for server verification
+#     ca_file: "/etc/gitlab/ssl/topology-ca.crt"
+#     # Client certificate for mTLS (if required by Topology Service)
+#     # cert_file: "/etc/gitlab/ssl/client.crt"
+#     # key_file: "/etc/gitlab/ssl/client.key"
+#     # Expected server name for TLS verification
+#     # server_name: "topology.gitlab.com"
+#     # Skip TLS verification (development only, not recommended for production)
+#     # insecure_skip_verify: false
+#
+#   # How gitlab-shell reaches the cell internal API resolved by the Topology
+#   # Service. Required when enabled.
+#   cell_endpoint:
+#     # URL scheme for resolved cell internal API requests: http or https
+#     scheme: "https"
+#     # Internal API port; always overrides any port returned by the Topology Service
+#     port: 8181

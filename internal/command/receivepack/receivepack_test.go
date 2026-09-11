@@ -3,6 +3,7 @@ package receivepack
 import (
 	"bytes"
 	"context"
+	"io"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -43,19 +44,26 @@ func TestCustomReceivePack(t *testing.T) {
 
 	_, err := cmd.Execute(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, "customoutput", output.String())
+
+	// Output of the Git HTTP protocol
+	require.Contains(t, output.String(), "ok refs/heads/master")
 }
 
 func setup(t *testing.T, keyID string, requests []testserver.TestRequestHandler) (*Command, *bytes.Buffer) {
 	url := testserver.StartSocketHTTPServer(t, requests)
 
 	output := &bytes.Buffer{}
-	input := bytes.NewBufferString("input")
+
+	pipeReader, pipeWriter := io.Pipe()
+	t.Cleanup(func() {
+		pipeWriter.Close()
+		pipeReader.Close()
+	})
 
 	cmd := &Command{
-		Config:     &config.Config{GitlabUrl: url},
+		Config:     &config.Config{GitlabURL: url},
 		Args:       &commandargs.Shell{GitlabKeyID: keyID, SSHArgs: []string{"git-receive-pack", "group/repo"}},
-		ReadWriter: &readwriter.ReadWriter{ErrOut: output, Out: output, In: input},
+		ReadWriter: &readwriter.ReadWriter{ErrOut: output, Out: output, In: pipeReader},
 	}
 
 	return cmd, output

@@ -5,9 +5,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"time"
 
-	"gitlab.com/gitlab-org/labkit/log"
+	"gitlab.com/gitlab-org/labkit/v2/log"
 
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/commandargs"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/readwriter"
@@ -40,23 +41,31 @@ func (c *Command) Execute(ctx context.Context) (context.Context, error) {
 	_, _ = fmt.Fprint(c.ReadWriter.Out, prompt)
 
 	resultCh := make(chan string)
+	sendResult := func(message string) {
+		select {
+		case resultCh <- message:
+		case <-ctx.Done():
+		}
+	}
+
 	go func() {
 		err := client.PushAuth(ctx, c.Args)
 		if err == nil {
-			resultCh <- "OTP has been validated by Push Authentication. Git operations are now allowed."
+			sendResult("OTP has been validated by Push Authentication. Git operations are now allowed.")
 		}
 	}()
 
 	go func() {
 		answer, err := c.getOTP(ctx)
 		if err != nil {
-			resultCh <- formatErr(err)
+			sendResult(formatErr(err))
+			return
 		}
 
 		if err := client.VerifyOTP(ctx, c.Args, answer); err != nil {
-			resultCh <- formatErr(err)
+			sendResult(formatErr(err))
 		} else {
-			resultCh <- "OTP validation successful. Git operations are now allowed."
+			sendResult("OTP validation successful. Git operations are now allowed.")
 		}
 	}()
 
@@ -67,7 +76,7 @@ func (c *Command) Execute(ctx context.Context) (context.Context, error) {
 		message = formatErr(ctx.Err())
 	}
 
-	log.WithContextFields(ctx, log.Fields{"message": message}).Info("Two factor verify command finished")
+	slog.InfoContext(ctx, "Two factor verify command finished", slog.String("message", message))
 	_, _ = fmt.Fprintf(c.ReadWriter.Out, "\n%v\n", message)
 
 	return ctx, nil
@@ -78,7 +87,7 @@ func (c *Command) getOTP(ctx context.Context) (string, error) {
 	otpLength := int64(64)
 	reader := io.LimitReader(c.ReadWriter.In, otpLength)
 	if _, err := fmt.Fscanln(reader, &answer); err != nil {
-		log.ContextLogger(ctx).WithError(err).Debug("twofactorverify: getOTP: Failed to get user input")
+		slog.DebugContext(ctx, "twofactorverify: getOTP: Failed to get user input", log.ErrorMessage(err.Error()))
 	}
 
 	if answer == "" {

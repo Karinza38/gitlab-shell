@@ -11,12 +11,14 @@ import (
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/commandargs"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/config"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/gitlabnet"
+	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/topology"
 )
 
 // Client represents a client for discovering GitLab users
 type Client struct {
-	config *config.Config
-	client *client.GitlabNetClient
+	config   *config.Config
+	client   *client.GitlabNetClient
+	resolver *topology.Resolver
 }
 
 // Response represents the response structure for user discovery
@@ -33,7 +35,11 @@ func NewClient(config *config.Config) (*Client, error) {
 		return nil, fmt.Errorf("error creating http client: %v", err)
 	}
 
-	return &Client{config: config, client: client}, nil
+	return &Client{
+		config:   config,
+		client:   client,
+		resolver: config.NewTopologyResolver(),
+	}, nil
 }
 
 // GetByCommandArgs retrieves user information based on command arguments
@@ -52,13 +58,14 @@ func (c *Client) GetByCommandArgs(ctx context.Context, args *commandargs.Shell) 
 		return nil, fmt.Errorf("who='' is invalid")
 	}
 
-	return c.getResponse(ctx, params)
+	return c.getResponse(ctx, params, args.UserArgs())
 }
 
-func (c *Client) getResponse(ctx context.Context, params url.Values) (*Response, error) {
+func (c *Client) getResponse(ctx context.Context, params url.Values, userArgs topology.UserArgs) (*Response, error) {
 	path := "/discover?" + params.Encode()
 
-	response, err := c.client.Get(ctx, path)
+	routed := c.resolver.ClientForUserArgs(ctx, c.client, userArgs)
+	response, err := routed.Client.Get(ctx, path)
 	if err != nil {
 		return nil, err
 	}

@@ -4,6 +4,7 @@ package authorizedkeys
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strconv"
 
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/commandargs"
@@ -26,8 +27,10 @@ func (c *Command) Execute(ctx context.Context) (context.Context, error) {
 	// This can happen when the user in sshd_config doesn't match the user
 	// trying to login. When nothing is printed, the user will be denied access.
 	if c.Args.ExpectedUser != c.Args.ActualUser {
-		// TODO: Log this event once we have a consistent way to log in Go.
-		// See https://gitlab.com/gitlab-org/gitlab-shell/issues/192 for more info.
+		slog.WarnContext(ctx, "authorized_keys: user mismatch, denying access",
+			slog.String("expected_user", c.Args.ExpectedUser),
+			slog.String("actual_user", c.Args.ActualUser),
+		)
 		return ctx, nil
 	}
 

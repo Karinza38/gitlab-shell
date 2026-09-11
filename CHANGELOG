@@ -1,3 +1,327 @@
+v14.57.3
+
+- Cells: Close Cells pull request body after negotiation !1546
+- Deduplicate Gitaly integration test setup !1544
+- Deduplicate LFS transfer test setup !1542
+
+v14.57.2
+
+- Geo: Fix SSH proxy hang by closing pull request body after negotiation !1537
+
+v14.57.1
+
+- Send Classify claims via the claims chain !1541
+
+v14.57.0
+
+- Add ssh-audit CI check for FIPS and non-FIPS SSH algorithms !1526
+- Port FIPS usage to labkit v2 fips/sshalgo packages !1524
+- Add Go 1.27 to CI testing matrix !1532
+- Refactor response validation and LFS request creation !1531
+- Update module gitlab.com/gitlab-org/labkit to v1.64.11 !1523
+- Fix nilaway potential nil-panic errors in production code !1527
+- Fix nilaway potential nil-panic errors in tests !1529
+- Extract repeated test string literals into constants !1528
+- Skip boringcrypto when Go's native FIPS module is selected !1516
+- Update module github.com/pires/go-proxyproto to v0.14.0 !1521
+- Make gotestsum/golangci-lint downloads more robust !1518
+- Update module gitlab.com/gitlab-org/labkit to v1.64.8 !1520
+
+v14.56.1
+
+- Fix gitlab-sshd CPU spin by upgrading golang.org/x/crypto to v0.54.0 !1517
+- Update the version of the logging field validator !1515
+
+v14.56.0
+
+- Add Cells SSH-over-HTTP routing for git push/pull !1472
+- Exclude client disconnects from the SSH session error SLI !1513
+- Log expected internal API 4xx responses below error level !1509
+- Exclude client cancellations from the SSH connection error SLI !1510
+- Update module golang.org/x/net to v0.55.0 !1512
+- Add NewSystemAPIError helper to reduce duplication !1502
+- Add explicit Topology Service cell endpoint configuration !1505
+
+v14.55.0
+
+- Prevent gitlab-sshd crash on startup errors !1506
+- Fix data race in sshd connection logger test !1507
+- Add a connection-level SSH reliability SLI !1501
+- Include correlation_id in Topology Service resolver logs !1498
+- Count internal API failures toward the SSH error SLI !1499
+- Fix goconst violations in test files !1495
+- Do not follow redirects for internal API requests !1497
+- Fix goconst lint violations in cmd/ test files !1494
+- Fix goconst lint violations in cmd/ and some internal/ test files !1488
+
+v14.54.0
+
+- Update module golang.org/x/crypto to v0.52.0 !1487
+- test(acceptance): subprocess acceptance test harness for healthcheck !1468
+- Add Go 1.26 to CI testing matrix !1491
+- Update github.com/charmbracelet/git-lfs-transfer digest to 1241631 !1479
+- Fix goconst violations in production code (part 1/3) !1485
+- Update module gitlab.com/gitlab-org/labkit to v1.64.2 !1484
+- Update dependency golangci-lint to v2.12.2 in Makefile !1482
+- Update dependency golangci-lint to v2.12.2 !1481
+- Update gitlab.com/gitlab-org/cells/topology-service digest to 2c761c2 !1480
+- Update module github.com/mattn/go-shellwords to v1.0.13 !1458
+- Update module github.com/open-feature/go-sdk to v1.17.2 !1478
+- Migrate SSH routing from SSHKey claim to SSHFingerprint claim !1476
+- Propagate SSH certificate CriticalOptions in permissions !1475
+
+v14.53.0
+
+- feat(command/healthcheck): gate client selection on feature flag !1467
+- feat(clients/gitlab): add HealthcheckClient for /check endpoint !1466
+- fix(clients/gitlab): match legacy client retry policy !1465
+- Improve Topology Service resolver logging !1470
+- Refactor ClientForRoute to return resolved cell address !1462
+- Remove verbose binary output logging in acceptance test !1471
+- Add Delivery tracker link to tag management guidelines !1473
+
+v14.51.0
+
+- Skip retries for non-transient Topology Service errors !1464
+- Add namespace_path to git audit event request !1460
+- Route user-scoped SSH command API calls via Topology Service !1457
+- Add username-based Topology Service resolution !1456
+
+v14.50.0
+
+- Update github.com/pires/go-proxyproto from v0.8.0 to v0.12.0 !1454
+- Route SSH auth requests via Topology Service !1451
+- Bump RUBY_VERSION to 3.3.11 !1452
+- Add retry with exponential backoff for classify calls !1443
+- Migrate to labkit v2/log logger-in-context API !1433
+- Route /allowed requests via Topology Service !1435
+- Fix `LogExecution: failed to parse user_id` warnings !1448
+- Add tag management guidelines to README !1449
+- Migrate topology client from labkit/log to labkit/v2/log !1438
+- Add scheme-aware Topology Service resolver !1445
+- Bootstrap labkit v2 feature flag client !1404
+- Bump Go version from 1.24.5 to 1.25.9 !1439
+- Fix lint warnings surfaced by golangci-lint v2 !1428
+- Support claim-based classification in Topology Service client !1400
+- Fix flaky sshd tests by using dynamic port allocation !1422
+- Update dependency golangci-lint to v2.11.4 !1427
+- Add logging field validator CI job !1402
+- Update module google.golang.org/grpc to v1.80.0 !1424
+
+v14.49.0
+
+- Pass key_id to git_audit_event endpoint for deploy key auth !1411
+
+v14.48.0
+
+- Add gl_key_type and gl_key_id to audit event logs !1412
+- Add support for instance-level SSH certificates via configuration !1396
+- Fix flaky TestSessionsMetrics test !1399
+- Bootstrap internal gitlab client using labkit v2 httpclient !1395
+- Add Prometheus metrics for Topology Service client !1385
+- Migrate logging to labkit v2 log helper methods !1394
+- Update LabKit to consolidate the HTTP Status !1393
+
+v14.47.0
+
+- Implement Topology Service gRPC client !1384
+- Migrate all logs to LabKit v2 !1381
+- Add Gitaly version linter !1371
+- Update module github.com/golang-jwt/jwt/v5 to v5.3.1 !1379
+
+v14.46.0
+
+- Add Gitaly retry policy  
+- Update gitlab.com/gitlab-org/cells/topology-service digest to af4593c !1386
+- Migrate all bar gitlab-shell to new slog labkit setup !1380
+- Bump Gitaly version to 18.9.0 !1373
+- Add Topology Service Go client dependency !1383
+- Add Topology Service configuration types !1382
+- Bumps the LabKit version to adopt the NewWithFile logging constructor !1372
+- Upgrade Gitaly to v18 !1373
+- Ensure logs are routed to correct file with correct min level !1369
+- Removes final Ruby Spec Tests from this repository !1368
+- Removes more Ruby Spec tests in favour of Go tests !1367
+- Fully Migrates gitlab-sshd over to Labkit v2 Log Package !1360
+- Removes and refactors Ruby Spec tests into Go !1364
+
+v14.45.6
+
+- Adds test logs to help validate new V2 LabKit Logging Setup !1348
+
+v14.45.5
+
+- Update ruby version to 3.3.10 !1342
+
+v14.45.3
+
+- Add gitlab-sshd acceptance tests for all supported SSH key types !1326
+- Move GOLANG_FIPS=1 back into tests:fips CI job !1327
+- Clean up FF geo_proxy_fetch_direct_to_primary_with_options !1329
+- Clean up FF geo_proxy_fetch_direct_to_primary !1330
+- Fix race in tests !1332
+- Clean up FF geo_proxy_direct_to_primary !1331
+
+v14.45.2
+
+- Update labkit to v1.27.1 to allow ED25519 with FIPS !1324
+
+v14.45.1
+
+- Relax FIPS default algorithms !1322
+
+v14.45.0
+
+- Make CI jobs use the local Go toolchain !1319
+- Add back default SSH algorithms for non-FIPS builds !1320
+
+v14.44.0
+
+- Update dependency go to v1.24.5 !1306
+- Update module golang.org/x/sync to v0.16.0 !1307
+- Update module github.com/golang-jwt/jwt/v5 to v5.2.3 !1310
+- Update Ruby development version to 3.3.9 !1312
+- Update module github.com/golang-jwt/jwt/v5 to v5.3.0 !1313
+- Remove hard-coded SSH supported algorithms !1315
+
+v14.43.0
+
+- Update module golang.org/x/crypto to v0.38.0 !1281
+- Send `check_ip` parameter in Git streaming audit event !1290
+- Allow dots, underscores, and uppercase in key_id validation !1284
+- Update Ruby dependencies !1292
+- Update module golang.org/x/sync to v0.15.0 !1293
+- Use `SOURCE_DATE_EPOCH` if set for build time !1291
+- Update dependency go to v1.24.4 !1294
+- Update dependency golang to v1.24.4 !1295
+- Update module gitlab.com/gitlab-org/labkit to v1.24.1 !1297
+- Fix "context-keys-type" linter warning !1301
+- Update module golang.org/x/crypto to v0.39.0 !1299
+- Include changes param in shellhorse Git over SSH !1300
+
+v14.42.0
+
+- Update CI RUBY_VERSION to 3.4.2 !1248
+- Revert "Merge branch 'pb-ci-ruby-version-3-4-2' into 'main'" !1249
+- Update github.com/charmbracelet/git-lfs-transfer digest to d4ecc24 !1250
+- Update Gitaly client dependency to include DNS lookup change !1251
+- Update module gitlab.com/gitlab-org/labkit to v1.23.1 !1252
+- Update module gitlab.com/gitlab-org/gitaly/v16 to v16.11.10 !1253
+- Update module gitlab.com/gitlab-org/labkit to v1.23.2 !1254
+- Update module github.com/golang-jwt/jwt/v5 to v5.2.2 !1256
+- Update module google.golang.org/protobuf to v1.36.6 !1257
+- Update dependency danger-review to v2.1.0 !1258
+- Update github.com/charmbracelet/git-lfs-transfer digest to fd7f679 !1259
+- Update dependency golang to v1.24.2 !1261
+- Update github.com/charmbracelet/git-lfs-transfer digest to e9f7fdb !1262
+- Update module github.com/prometheus/client_golang to v1.22.0 !1263
+- Update Gitlab-shell Gitaly client dependency !1266
+- Update github.com/charmbracelet/git-lfs-transfer digest to 4db3867 !1267
+- Update dependency ruby to v3.4.3 !1268
+- Update module google.golang.org/grpc to v1.72.0 !1269
+- Update github.com/charmbracelet/git-lfs-transfer digest to cdc13fa !1273
+- Update module gitlab.com/gitlab-org/labkit to v1.24.0 !1274
+- Go 1.24.2 update !1275
+- Update dependency gitlab-dangerfiles to '~> 4.9.1' !1278
+- Update github.com/charmbracelet/git-lfs-transfer digest to 0d51139 !1279
+- Update dependency go to v1.24.3 !1282
+- Update dependency golang to v1.24.3 !1283
+- Ensure nilaway only scans gitlab-shell !1285
+
+v14.41.0
+
+- Update module golang.org/x/sync to v0.12.0 !1244
+- Update dependency golang to v1.24.1 !1243
+- Update module github.com/prometheus/client_golang to v1.21.1 !1242
+- Update github.com/charmbracelet/git-lfs-transfer digest to 805ee9c !1241
+- Update module github.com/prometheus/client_golang to v1.21.0 !1234
+- Update module gitlab.com/gitlab-org/labkit to v1.22.0 !1240
+- Update dependency ruby to v3.4.2 !1232
+- Update module golang.org/x/crypto to v0.35.0 !1237
+- Update github.com/charmbracelet/git-lfs-transfer digest to ccc940e !1231
+- Update module golang.org/x/crypto to v0.33.0 !1222
+- Update dependency golang to v1.24.0 !1226
+- Update module google.golang.org/protobuf to v1.36.5 !1217
+- Update github.com/charmbracelet/git-lfs-transfer digest to db48881 !1219
+- Update dependency gitlab-dangerfiles to '~> 4.8.1' !1223
+
+v14.40.0
+
+- Bump development Ruby version to 3.3.7 !1224
+- Update module github.com/otiai10/copy to v1.14.1 !1220
+- Update module google.golang.org/grpc to v1.69.2 !1216
+- Update github.com/charmbracelet/git-lfs-transfer digest to e0340c3 !1215
+- Update module golang.org/x/crypto to v0.31.0 !1214
+- Update dependency webrick to '~> 1.9', '>= 1.9.1' !1212
+- Update module google.golang.org/grpc to v1.68.1 !1196
+- Update github.com/charmbracelet/git-lfs-transfer digest to f587eea !1210
+- Update module golang.org/x/crypto to v0.30.0 !1208
+- Update dependency danger-review to v2 !1206
+- Update module golang.org/x/sync to v0.10.0 !1207
+- Update dependency golang to v1.23.4 !1205
+- Update dependency danger-review to v1.4.2 !1204
+- Update github.com/charmbracelet/git-lfs-transfer digest to b2a2ff3 !1202
+- Update dependency ruby to v3.3.6 !1192
+- Update github.com/charmbracelet/git-lfs-transfer digest to b9a7efd !1199
+- Update module github.com/stretchr/testify to v1.10.0 !1201
+- Update module google.golang.org/protobuf to v1.35.2 !1200
+- Update module golang.org/x/crypto to v0.29.0 !1198
+- Update module golang.org/x/sync to v0.9.0 !1197
+- Update dependency golang to v1.23.3 !1194
+- Update CONTRIBUTING.md and LICENSE !1193
+- Update dependency webrick to '~> 1.9' !1191
+- Upgrade golang-code-intel version !1190
+- Fix code-navigation job !1189
+- Update module github.com/prometheus/client_golang to v1.20.5 !1187
+- Update module github.com/pires/go-proxyproto to v0.8.0 !1184
+- Update LabKit library to v1.21.2 !1186
+- Update github.com/charmbracelet/git-lfs-transfer digest to 422d244 !1181
+- Update module google.golang.org/protobuf to v1.35.1 !1180
+- Update module golang.org/x/crypto to v0.28.0 !1178
+- Update dependency golang to v1.23.2 !1177
+- Update module google.golang.org/grpc to v1.67.1 !1169
+- Update dependency webrick to '~> 1.8', '>= 1.8.2' !1175
+- Lint fixes for commandargs packages !1145
+- Update module github.com/prometheus/client_golang to v1.20.4 !1172
+- Resolve "Add current release process to the new README.md" !1174
+- Resolve "Expand the README.md with more details" !1173
+- ci: Bump Ruby/RubyGems versions in CI images !1171
+- Update module gitlab.com/gitlab-org/gitaly/v16 to v16.11.10 !1170
+- Lint fixes for console executable and gitaly packages !1154
+- Fix 'go-require: do not use require in http handlers (testifylint)' linter errors !1168
+- Lint fixes for customaction package !1147
+- Lint fixes in healthcheck and discover package !1150
+- Improve logging on errors !1156
+- Lint fixes for personalaccesstoken package !1146
+- Update module gitlab.com/gitlab-org/gitaly/v16 to v16.11.9 !1167
+- Update github.com/charmbracelet/git-lfs-transfer digest to edbf581 !1165
+- Update module google.golang.org/grpc to v1.66.1 !1166
+- Lint fixes for sshd packages !1138
+- Lint fixes for lfs packages !1139
+- Lint fixes for shared packages !1157
+- Added inspecting result in connection !1136
+- Update module github.com/prometheus/client_golang to v1.20.3 !1161
+- Update module golang.org/x/crypto to v0.27.0 !1163
+- Lint fixes in gitlabshell packages !1152
+- Update dependency golang to v1.23.1 !1162
+- Lint fixes for logger metrics and pktline packages !1155
+- Lint fixes in accessverifier package !1153
+- Lint fixes in gitlabnet git package !1149
+- Lint fixes for authorized keys and principal packages !1151
+- Update dependency ruby to v3.3.5 !1160
+- Lint fixes for githttp package !1144
+- Lint fixes for twofactor packages !1143
+- Update module google.golang.org/grpc to v1.66.0 !1142
+- Lint fixes for audit event packages !1140
+- Update config.yml with a configuration for PAT !1141
+- Update module github.com/prometheus/client_golang to v1.20.2 !1134
+- Update `golangci` to 1.60.3 and `gotestsum` to 1.12.0 !1135
+- Improve lint error reporting !1133
+- Update golangci to 1.60.2 !1132
+- Update module github.com/prometheus/client_golang to v1.20.1 !1130
+- Resolve "Add support for Go 1.23 to gitlab-shell" !1128
+- Resolve "Only run `nilaway` CI job when there's actual `.go` changes" !1127
+
 v14.39.0
 
 - Revise CODEOWNERS to use entire TW team !1125

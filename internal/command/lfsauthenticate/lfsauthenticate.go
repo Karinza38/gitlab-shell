@@ -6,8 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-
-	"gitlab.com/gitlab-org/labkit/log"
+	"log/slog"
 
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/commandargs"
@@ -15,7 +14,9 @@ import (
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/shared/accessverifier"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/shared/disallowedcommand"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/config"
+	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/gitlabnet"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/gitlabnet/lfsauthenticate"
+	"gitlab.com/gitlab-org/labkit/v2/log"
 )
 
 const (
@@ -73,18 +74,30 @@ func (c *Command) Execute(ctx context.Context) (context.Context, error) {
 	)
 	ctxWithLogData := context.WithValue(ctx, logInfo{}, logData)
 
-	payload, err := c.authenticate(ctx, operation, repo, accessResponse.UserID)
+	payload, err := c.authenticate(ctx, operation, repo, accessResponse.UserID, accessResponse.CellAddress)
 	if err != nil {
 		// return nothing just like Ruby's GitlabShell#lfs_authenticate does
-		log.WithContextFields(
-			ctx,
-			log.Fields{"operation": operation, "repo": repo, "user_id": accessResponse.UserID},
-		).WithError(err).Debug("lfsauthenticate: execute: LFS authentication failed")
+		attrs := []any{
+			slog.String("operation", operation),
+			slog.String("gl_repository", repo),
+			log.ErrorMessage(err.Error()),
+		}
+
+		glID, parseErr := gitlabnet.ParseGlID(accessResponse.UserID)
+		if parseErr != nil {
+			slog.WarnContext(ctx, "lfsauthenticate: execute: failed to parse user_id", log.ErrorMessage(parseErr.Error()))
+		} else if userID, ok := glID.UserID(); ok {
+			attrs = append(attrs, log.GitLabUserID(userID))
+		}
+
+		slog.DebugContext(ctx, "lfsauthenticate: execute: LFS authentication failed", attrs...)
 
 		return ctxWithLogData, nil
 	}
 
-	fmt.Fprintf(c.ReadWriter.Out, "%s\n", payload)
+	if _, err := fmt.Fprintf(c.ReadWriter.Out, "%s\n", payload); err != nil {
+		return ctxWithLogData, err
+	}
 
 	return ctxWithLogData, nil
 }
@@ -114,13 +127,13 @@ func (c *Command) verifyAccess(ctx context.Context, action commandargs.CommandTy
 	return cmd.Verify(ctx, action, repo)
 }
 
-func (c *Command) authenticate(ctx context.Context, operation string, repo, userID string) ([]byte, error) {
+func (c *Command) authenticate(ctx context.Context, operation string, repo, userID, cellAddress string) ([]byte, error) {
 	client, err := lfsauthenticate.NewClient(c.Config, c.Args)
 	if err != nil {
 		return nil, err
 	}
 
-	response, err := client.Authenticate(ctx, operation, repo, userID)
+	response, err := client.Authenticate(ctx, operation, repo, userID, cellAddress)
 	if err != nil {
 		return nil, err
 	}

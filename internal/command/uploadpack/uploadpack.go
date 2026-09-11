@@ -11,7 +11,6 @@ import (
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/gitauditevent"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/readwriter"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/shared/accessverifier"
-	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/shared/customaction"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/shared/disallowedcommand"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/config"
 )
@@ -46,24 +45,19 @@ func (c *Command) Execute(ctx context.Context) (context.Context, error) {
 	)
 	ctxWithLogData := context.WithValue(ctx, logDataKey{}, logData)
 
+	if response.IsCellRouted() {
+		return ctxWithLogData, githttp.NewCellsPullCommand(c.Config, c.ReadWriter, c.Args, response).Execute(ctx)
+	}
+
 	if response.IsCustomAction() {
-		if response.Payload.Data.GeoProxyFetchDirectToPrimary {
-			cmd := githttp.PullCommand{
-				Config:     c.Config,
-				ReadWriter: c.ReadWriter,
-				Args:       c.Args,
-				Response:   response,
-			}
-
-			return ctxWithLogData, cmd.Execute(ctx)
-		}
-
-		customAction := customaction.Command{
+		cmd := githttp.PullCommand{
 			Config:     c.Config,
 			ReadWriter: c.ReadWriter,
-			EOFSent:    false,
+			Args:       c.Args,
+			Response:   response,
 		}
-		return ctxWithLogData, customAction.Execute(ctx, response)
+
+		return ctxWithLogData, cmd.Execute(ctx)
 	}
 
 	stats, err := c.performGitalyCall(ctx, response)
@@ -72,7 +66,7 @@ func (c *Command) Execute(ctx context.Context) (context.Context, error) {
 	}
 
 	if response.NeedAudit {
-		gitauditevent.Audit(ctx, c.Args.CommandType, c.Config, response, stats)
+		gitauditevent.Audit(ctx, c.Args, c.Config, response, stats)
 	}
 	return ctxWithLogData, nil
 }

@@ -37,10 +37,10 @@ func main() {
 
 	code, err := execute(readWriter)
 	if err != nil {
-		fmt.Fprintf(readWriter.ErrOut, "%v\n", err)
+		_, _ = fmt.Fprintf(readWriter.ErrOut, "%v\n", err)
 	}
 
-	os.Exit(int(code))
+	os.Exit(code)
 }
 
 func execute(readWriter *readwriter.ReadWriter) (int, error) {
@@ -53,9 +53,12 @@ func execute(readWriter *readwriter.ReadWriter) (int, error) {
 	if err != nil {
 		return exitCodeFailure, fmt.Errorf("failed to read config, exiting")
 	}
+	defer config.Close() //nolint:errcheck
 
-	logCloser := logger.Configure(config)
-	defer func() { _ = logCloser.Close() }()
+	logCloser := logger.ConfigureLogger(config)
+	if logCloser != nil {
+		defer logCloser.Close() //nolint:errcheck
+	}
 
 	cmd, err := cmd.New(os.Args[1:], config, readWriter)
 	if err != nil {

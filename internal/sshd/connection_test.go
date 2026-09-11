@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sync/semaphore"
@@ -93,7 +94,7 @@ func setup(newChannel *fakeNewChannel) (*connection, chan ssh.NewChannel) {
 }
 
 func TestPanicDuringSessionIsRecovered(t *testing.T) {
-	newChannel := &fakeNewChannel{channelType: "session"}
+	newChannel := &fakeNewChannel{channelType: sessionChannelType}
 	conn, chans := setup(newChannel)
 
 	numSessions := 0
@@ -129,7 +130,7 @@ func TestTooManySessions(t *testing.T) {
 	rejectCh := make(chan rejectCall)
 	defer close(rejectCh)
 
-	newChannel := &fakeNewChannel{channelType: "session", rejectCh: rejectCh}
+	newChannel := &fakeNewChannel{channelType: sessionChannelType, rejectCh: rejectCh}
 	conn, chans := setup(newChannel)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -147,7 +148,7 @@ func TestTooManySessions(t *testing.T) {
 }
 
 func TestAcceptSessionSucceeds(t *testing.T) {
-	newChannel := &fakeNewChannel{channelType: "session"}
+	newChannel := &fakeNewChannel{channelType: sessionChannelType}
 	conn, chans := setup(newChannel)
 	ctx := context.Background()
 
@@ -166,7 +167,7 @@ func TestAcceptSessionFails(t *testing.T) {
 	defer close(acceptCh)
 
 	acceptErr := errors.New("some failure")
-	newChannel := &fakeNewChannel{channelType: "session", acceptCh: acceptCh, acceptErr: acceptErr}
+	newChannel := &fakeNewChannel{channelType: sessionChannelType, acceptCh: acceptCh, acceptErr: acceptErr}
 	conn, chans := setup(newChannel)
 	ctx := context.Background()
 
@@ -205,7 +206,7 @@ func TestSessionsMetrics(t *testing.T) {
 	initialSessionsTotal := testutil.ToFloat64(metrics.SliSshdSessionsTotal)
 	initialSessionsErrorTotal := testutil.ToFloat64(metrics.SliSshdSessionsErrorsTotal)
 
-	newChannel := &fakeNewChannel{channelType: "session"}
+	newChannel := &fakeNewChannel{channelType: sessionChannelType}
 	conn, chans := setup(newChannel)
 	ctx := context.Background()
 
@@ -214,8 +215,8 @@ func TestSessionsMetrics(t *testing.T) {
 		return errors.New("custom error")
 	})
 
-	eventuallyInDelta(t, initialSessionsTotal+1, testutil.ToFloat64(metrics.SliSshdSessionsTotal))
-	eventuallyInDelta(t, initialSessionsErrorTotal+1, testutil.ToFloat64(metrics.SliSshdSessionsErrorsTotal))
+	eventuallyInDelta(t, initialSessionsTotal+1, func() float64 { return testutil.ToFloat64(metrics.SliSshdSessionsTotal) })
+	eventuallyInDelta(t, initialSessionsErrorTotal+1, func() float64 { return testutil.ToFloat64(metrics.SliSshdSessionsErrorsTotal) })
 
 	for i, ignoredError := range []struct {
 		desc string
@@ -237,15 +238,193 @@ func TestSessionsMetrics(t *testing.T) {
 				return ignored
 			})
 
-			eventuallyInDelta(t, initialSessionsTotal+2+float64(i), testutil.ToFloat64(metrics.SliSshdSessionsTotal))
-			eventuallyInDelta(t, initialSessionsErrorTotal+1, testutil.ToFloat64(metrics.SliSshdSessionsErrorsTotal))
+			eventuallyInDelta(t, initialSessionsTotal+2+float64(i), func() float64 { return testutil.ToFloat64(metrics.SliSshdSessionsTotal) })
+			eventuallyInDelta(t, initialSessionsErrorTotal+1, func() float64 { return testutil.ToFloat64(metrics.SliSshdSessionsErrorsTotal) })
 		})
 	}
 }
 
-func eventuallyInDelta(t *testing.T, expected, actual float64) {
+func TestSessionErrorMetricDistinguishesAPIErrors(t *testing.T) {
+	newChannel := &fakeNewChannel{channelType: sessionChannelType}
+
+	for _, tc := range []struct {
+		desc    string
+		err     error
+		counted bool
+	}{
+		{
+			desc:    "policy API error is not counted",
+			err:     &client.APIError{Msg: "You are not allowed to push", StatusCode: 403},
+			counted: false,
+		},
+		{
+			desc:    "system API error (redirect misroute) is counted",
+			err:     &client.APIError{Msg: `Internal API returned redirect (301) to "http://gitlab.com"`, StatusCode: 301, System: true},
+			counted: true,
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			initialErrorTotal := testutil.ToFloat64(metrics.SliSshdSessionsErrorsTotal)
+
+			conn, chans := setup(newChannel)
+			err := tc.err
+			conn.handleRequests(context.Background(), nil, chans, func(context.Context, *ssh.ServerConn, ssh.Channel, <-chan *ssh.Request) error {
+				close(chans)
+				return err
+			})
+
+			expected := initialErrorTotal
+			if tc.counted {
+				expected = initialErrorTotal + 1
+			}
+			eventuallyInDelta(t, expected, func() float64 { return testutil.ToFloat64(metrics.SliSshdSessionsErrorsTotal) })
+		})
+	}
+}
+
+func TestConnOutcomeObserveAuth(t *testing.T) {
+	t.Run("nil error marks attempted without a server error", func(t *testing.T) {
+		var o connOutcome
+		o.observeAuth(nil)
+		require.True(t, o.authAttempted)
+		require.False(t, o.serverError.Load())
+	})
+
+	t.Run("system APIError marks a server error", func(t *testing.T) {
+		var o connOutcome
+		o.observeAuth(&client.APIError{Msg: "redirect", StatusCode: 301, System: true})
+		require.True(t, o.authAttempted)
+		require.True(t, o.serverError.Load())
+	})
+
+	t.Run("policy APIError does not mark a server error", func(t *testing.T) {
+		var o connOutcome
+		o.observeAuth(&client.APIError{Msg: "You are not allowed", StatusCode: 403})
+		require.True(t, o.authAttempted)
+		require.False(t, o.serverError.Load())
+	})
+
+	t.Run("plain error does not mark a server error", func(t *testing.T) {
+		var o connOutcome
+		o.observeAuth(errors.New("unknown user"))
+		require.True(t, o.authAttempted)
+		require.False(t, o.serverError.Load())
+	})
+
+	t.Run("a later successful attempt clears an earlier server error", func(t *testing.T) {
+		var o connOutcome
+		o.observeAuth(&client.APIError{Msg: "redirect", StatusCode: 301, System: true})
+		require.True(t, o.serverError.Load())
+
+		// The next key the client offers authenticates successfully.
+		o.observeAuth(nil)
+		require.True(t, o.authAttempted)
+		require.False(t, o.serverError.Load(), "ultimate success must not count as an error")
+	})
+}
+
+func TestTrackErrorFeedsConnectionOutcome(t *testing.T) {
+	t.Run("server-side session error marks the connection outcome", func(t *testing.T) {
+		c := &connection{}
+		c.trackError(context.Background(), &client.APIError{Msg: "boom", StatusCode: 500, System: true})
+		require.True(t, c.outcome.serverError.Load())
+	})
+
+	t.Run("client-side session error does not", func(t *testing.T) {
+		c := &connection{}
+		c.trackError(context.Background(), &client.APIError{Msg: "denied", StatusCode: 403})
+		require.False(t, c.outcome.serverError.Load())
+	})
+}
+
+func TestTrackErrorClientDisconnects(t *testing.T) {
+	for _, tc := range []struct {
+		desc    string
+		err     error
+		counted bool
+	}{
+		{
+			desc:    "broken pipe (client disconnected mid-transfer) is not counted",
+			err:     grpcstatus.Error(grpccodes.Internal, `running upload-pack: cmd wait: signal: broken pipe, stderr: ""`),
+			counted: false,
+		},
+		{
+			desc:    "copy response EOF (client disconnected) is not counted",
+			err:     errors.New("copy response: EOF"),
+			counted: false,
+		},
+		{
+			desc:    "broken pipe without an Internal gRPC code is counted (match is gated on Internal)",
+			err:     errors.New("signal: broken pipe"),
+			counted: true,
+		},
+		{
+			desc:    "genuine internal server error is still counted",
+			err:     grpcstatus.Error(grpccodes.Internal, "running upload-pack: cmd wait: exit status 1"),
+			counted: true,
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			initial := testutil.ToFloat64(metrics.SliSshdSessionsErrorsTotal)
+
+			c := &connection{}
+			c.trackError(context.Background(), tc.err)
+
+			expected := initial
+			if tc.counted {
+				expected = initial + 1
+			}
+			assert.InDelta(t, expected, testutil.ToFloat64(metrics.SliSshdSessionsErrorsTotal), 0.0001)
+			assert.Equal(t, tc.counted, c.outcome.serverError.Load())
+		})
+	}
+}
+
+func TestTrackConnection(t *testing.T) {
+	for _, tc := range []struct {
+		desc       string
+		setup      func(*connOutcome)
+		wantTotal  float64
+		wantErrors float64
+	}{
+		{
+			desc:       "no auth attempted is not counted (e.g. port scanner / health check)",
+			setup:      func(*connOutcome) {},
+			wantTotal:  0,
+			wantErrors: 0,
+		},
+		{
+			desc:       "auth attempted and succeeded counts as a connection, not an error",
+			setup:      func(o *connOutcome) { o.authAttempted = true },
+			wantTotal:  1,
+			wantErrors: 0,
+		},
+		{
+			desc:       "server-side failure counts as a connection error",
+			setup:      func(o *connOutcome) { o.authAttempted = true; o.serverError.Store(true) },
+			wantTotal:  1,
+			wantErrors: 1,
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			initTotal := testutil.ToFloat64(metrics.SliSshdConnectionsTotal)
+			initErrors := testutil.ToFloat64(metrics.SliSshdConnectionsErrorsTotal)
+
+			c := &connection{}
+			tc.setup(&c.outcome)
+			c.trackConnection()
+
+			require.InDelta(t, initTotal+tc.wantTotal, testutil.ToFloat64(metrics.SliSshdConnectionsTotal), 0.01)
+			require.InDelta(t, initErrors+tc.wantErrors, testutil.ToFloat64(metrics.SliSshdConnectionsErrorsTotal), 0.01)
+		})
+	}
+}
+
+func eventuallyInDelta(t *testing.T, expected float64, actualFunc func() float64) {
+	t.Helper()
 	var delta = 0.1
-	require.Eventually(t, func() bool {
-		return ((expected - actual) < delta)
-	}, 1*time.Second, time.Millisecond)
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		actual := actualFunc()
+		assert.InDelta(c, expected, actual, delta, "expected: %f, actual: %f", expected, actual)
+	}, 5*time.Second, time.Millisecond)
 }

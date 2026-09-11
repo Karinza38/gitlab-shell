@@ -4,13 +4,14 @@ package gitaly
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"google.golang.org/grpc"
 
-	gitalyauth "gitlab.com/gitlab-org/gitaly/v16/auth"
-	gitalyclient "gitlab.com/gitlab-org/gitaly/v16/client"
+	gitalyauth "gitlab.com/gitlab-org/gitaly/v18/auth"
+	gitalyclient "gitlab.com/gitlab-org/gitaly/v18/client"
 	"gitlab.com/gitlab-org/labkit/correlation"
 	grpccorrelation "gitlab.com/gitlab-org/labkit/correlation/grpc"
 	"gitlab.com/gitlab-org/labkit/log"
@@ -19,17 +20,24 @@ import (
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/metrics"
 )
 
-// Command represents a gRPC service command with its address and token.
-type Command struct {
+// CacheKey contains the fields used for connection caching.
+type CacheKey struct {
 	ServiceName string
 	Address     string
 	Token       string
 }
 
+// Command represents a gRPC service command with its address and token.
+type Command struct {
+	CacheKey
+
+	RetryPolicy *gitalyclient.RetryPolicy
+}
+
 type connectionsCache struct {
 	sync.RWMutex
 
-	connections map[Command]*grpc.ClientConn
+	connections map[CacheKey]*grpc.ClientConn
 }
 
 // Client manages connections to Gitaly services and handles sidechannel communication.
@@ -46,8 +54,10 @@ func (c *Client) InitSidechannelRegistry(ctx context.Context) {
 
 // GetConnection returns a gRPC connection for the given command, using a cached connection if available.
 func (c *Client) GetConnection(ctx context.Context, cmd Command) (*grpc.ClientConn, error) {
+	key := CacheKey{ServiceName: cmd.ServiceName, Address: cmd.Address, Token: cmd.Token}
+
 	c.cache.RLock()
-	existingConn := c.cache.connections[cmd]
+	existingConn := c.cache.connections[key]
 	c.cache.RUnlock()
 
 	if existingConn != nil {
@@ -57,7 +67,7 @@ func (c *Client) GetConnection(ctx context.Context, cmd Command) (*grpc.ClientCo
 	c.cache.Lock()
 	defer c.cache.Unlock()
 
-	if cachedConn := c.cache.connections[cmd]; cachedConn != nil {
+	if cachedConn := c.cache.connections[key]; cachedConn != nil {
 		return cachedConn, nil
 	}
 
@@ -67,10 +77,10 @@ func (c *Client) GetConnection(ctx context.Context, cmd Command) (*grpc.ClientCo
 	}
 
 	if c.cache.connections == nil {
-		c.cache.connections = make(map[Command]*grpc.ClientConn)
+		c.cache.connections = make(map[CacheKey]*grpc.ClientConn)
 	}
 
-	c.cache.connections[cmd] = newConn
+	c.cache.connections[key] = newConn
 
 	return newConn, nil
 }
@@ -92,14 +102,12 @@ func (c *Client) newConnection(ctx context.Context, cmd Command) (conn *grpc.Cli
 	if serviceName == "" {
 		serviceName = "gitlab-shell-unknown"
 
-		log.WithContextFields(ctx, log.Fields{"service_name": serviceName}).Warn("No gRPC service name specified, defaulting to gitlab-shell-unknown")
+		slog.WarnContext(ctx, "No gRPC service name specified, defaulting to gitlab-shell-unknown", slog.String("service_name", serviceName))
 	}
 
 	serviceName = fmt.Sprintf("%s-%s", serviceName, cmd.ServiceName)
 
-	connOpts := gitalyclient.DefaultDialOpts
-	connOpts = append(
-		connOpts,
+	grpcOpts := []grpc.DialOption{
 		grpc.WithChainStreamInterceptor(
 			grpctracing.StreamClientTracingInterceptor(),
 			grpc_prometheus.StreamClientInterceptor,
@@ -115,7 +123,6 @@ func (c *Client) newConnection(ctx context.Context, cmd Command) (conn *grpc.Cli
 				grpccorrelation.WithClientName(serviceName),
 			),
 		),
-
 		// In https://gitlab.com/groups/gitlab-org/-/epics/8971, we added DNS discovery support to Praefect. This was
 		// done by making two changes:
 		// - Configure client-side round-robin load-balancing in client dial options. We added that as a default option
@@ -125,13 +132,21 @@ func (c *Client) newConnection(ctx context.Context, cmd Command) (conn *grpc.Cli
 		// Afterward, workhorse can detect and handle DNS discovery automatically. The user needs to setup and set
 		// Gitaly address to something like "dns:gitaly.service.dc1.consul"
 		gitalyclient.WithGitalyDNSResolver(gitalyclient.DefaultDNSResolverBuilderConfig()),
-	)
+	}
 
 	if cmd.Token != "" {
-		connOpts = append(connOpts,
+		grpcOpts = append(grpcOpts,
 			grpc.WithPerRPCCredentials(gitalyauth.RPCCredentialsV2(cmd.Token)),
 		)
 	}
 
-	return gitalyclient.DialSidechannel(ctx, cmd.Address, c.SidechannelRegistry, connOpts)
+	connOpts := []gitalyclient.DialOption{
+		gitalyclient.WithGrpcOptions(grpcOpts),
+	}
+
+	if cmd.RetryPolicy != nil {
+		connOpts = append(connOpts, gitalyclient.WithRetryPolicy(cmd.RetryPolicy))
+	}
+
+	return gitalyclient.DialSidechannel(ctx, cmd.Address, c.SidechannelRegistry, connOpts...)
 }

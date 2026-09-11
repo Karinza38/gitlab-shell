@@ -4,6 +4,7 @@ package sshd
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -20,7 +21,8 @@ import (
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/metrics"
 
 	"gitlab.com/gitlab-org/labkit/correlation"
-	"gitlab.com/gitlab-org/labkit/log"
+	"gitlab.com/gitlab-org/labkit/v2/fields"
+	"gitlab.com/gitlab-org/labkit/v2/log"
 )
 
 type status int
@@ -37,6 +39,12 @@ const (
 
 	// StatusClosed represents the closed status of the SSH server
 	StatusClosed
+)
+
+const (
+	proxyPolicyRequire = "require"
+	proxyPolicyIgnore  = "ignore"
+	proxyPolicyReject  = "reject"
 )
 
 // Server represents an SSH server instance
@@ -85,6 +93,17 @@ func (s *Server) Shutdown() error {
 	return s.listener.Close()
 }
 
+// Addr returns the listener's network address, or an empty string if not yet listening.
+func (s *Server) Addr() string {
+	s.statusMu.RLock()
+	defer s.statusMu.RUnlock()
+
+	if s.listener == nil {
+		return ""
+	}
+	return s.listener.Addr().String()
+}
+
 // MonitoringServeMux returns the ServeMux for monitoring endpoints
 func (s *Server) MonitoringServeMux() *http.ServeMux {
 	mux := http.NewServeMux()
@@ -118,22 +137,19 @@ func (s *Server) listen(ctx context.Context) error {
 
 		sshListener = &proxyproto.Listener{
 			Listener:          sshListener,
-			Policy:            policy,
+			ConnPolicy:        policy,
 			ReadHeaderTimeout: time.Duration(s.Config.Server.ProxyHeaderTimeout),
 		}
 
-		log.ContextLogger(ctx).Info("Proxy protocol is enabled")
-	}
-
-	fields := log.Fields{
-		"tcp_address": sshListener.Addr().String(),
+		ctx = log.AppendFields(ctx, log.TCPAddress(sshListener.Addr().String()))
+		log.FromContext(ctx).InfoContext(ctx, "Proxy protocol is enabled")
 	}
 
 	if len(s.serverConfig.cfg.Server.PublicKeyAlgorithms) > 0 {
-		fields["supported_public_key_algorithms"] = s.serverConfig.cfg.Server.PublicKeyAlgorithms
+		ctx = log.AppendFields(ctx, slog.Any("supported_public_key_algorithms", s.serverConfig.cfg.Server.PublicKeyAlgorithms))
 	}
 
-	log.WithContextFields(ctx, fields).Info("Listening for SSH connections")
+	log.FromContext(ctx).InfoContext(ctx, "Listening for SSH connections")
 
 	s.listener = sshListener
 
@@ -150,7 +166,7 @@ func (s *Server) serve(ctx context.Context) {
 				break
 			}
 
-			log.ContextLogger(ctx).WithError(err).Warn("Failed to accept connection")
+			log.FromContext(ctx).WarnContext(ctx, "Failed to accept connection", log.ErrorMessage(err.Error()))
 			continue
 		}
 
@@ -177,7 +193,13 @@ func (s *Server) getStatus() status {
 }
 
 func contextWithValues(parent context.Context, nconn net.Conn) context.Context {
-	ctx := correlation.ContextWithCorrelation(parent, correlation.SafeRandomID())
+	correlationID := correlation.SafeRandomID()
+	ctx := correlation.ContextWithCorrelation(parent, correlationID)
+	// Seed a logger carrying the per-connection correlation_id so log lines
+	// emitted during this connection stay in sync with the value outbound HTTP
+	// requests propagate via X-Request-Id. Without this step the logger
+	// inherits the parent/process correlation_id and the two diverge.
+	ctx = log.WithLogger(ctx, slog.Default().With(slog.String(fields.CorrelationID, correlationID)))
 
 	// If we're dealing with a PROXY connection, register the original requester's IP
 	mconn, ok := nconn.(*proxyproto.Conn)
@@ -197,19 +219,18 @@ func (s *Server) handleConn(ctx context.Context, nconn net.Conn) {
 
 	ctx, cancel := context.WithCancel(contextWithValues(ctx, nconn))
 	defer cancel()
+	remoteAddr := nconn.RemoteAddr().String()
+	ctx = log.AppendFields(ctx, slog.String("remote_addr", remoteAddr))
+
 	go func() {
 		<-ctx.Done()
 		_ = nconn.Close() // Close the connection when context is canceled
 	}()
 
-	remoteAddr := nconn.RemoteAddr().String()
-	ctxlog := log.WithContextFields(ctx, log.Fields{"remote_addr": remoteAddr})
-
 	// Prevent a panic in a single connection from taking out the whole server
 	defer func() {
 		if err := recover(); err != nil {
-			ctxlog.WithField("recovered_error", err).Error("panic handling session")
-
+			log.FromContext(ctx).ErrorContext(ctx, "panic handling session", slog.Any("recovered_error", err))
 			metrics.SliSshdSessionsErrorsTotal.Inc()
 		}
 	}()
@@ -219,14 +240,14 @@ func (s *Server) handleConn(ctx context.Context, nconn net.Conn) {
 
 	var ctxWithLogData context.Context
 
-	conn.handle(ctx, s.serverConfig.get(ctx), func(ctx context.Context, sconn *ssh.ServerConn, channel ssh.Channel, requests <-chan *ssh.Request) error {
+	conn.handle(ctx, s.serverConfig.get(ctx, &conn.outcome), func(ctx context.Context, sconn *ssh.ServerConn, channel ssh.Channel, requests <-chan *ssh.Request) error {
 		session := &session{
 			cfg:                 s.Config,
 			channel:             channel,
 			gitlabKeyID:         sconn.Permissions.Extensions["key-id"],
 			gitlabKrb5Principal: sconn.Permissions.Extensions["krb5principal"],
-			gitlabUsername:      sconn.Permissions.Extensions["username"],
-			namespace:           sconn.Permissions.Extensions["namespace"],
+			gitlabUsername:      sconn.Permissions.Extensions[certPermUsername],
+			namespace:           sconn.Permissions.Extensions[certPermNamespace],
 			remoteAddr:          remoteAddr,
 			started:             time.Now(),
 		}
@@ -238,45 +259,30 @@ func (s *Server) handleConn(ctx context.Context, nconn net.Conn) {
 	})
 
 	logData := extractLogDataFromContext(ctxWithLogData)
-
-	ctxlog.WithFields(log.Fields{
-		"duration_s":    time.Since(started).Seconds(),
-		"written_bytes": logData.WrittenBytes,
-		"meta":          logData.Meta,
-	}).Info("access: finish")
+	log.FromContext(ctx).InfoContext(ctx, "access: finish",
+		log.DurationS(time.Since(started)),
+		slog.Int64("written_bytes", logData.WrittenBytes),
+		slog.Any("meta", logData.Meta),
+	)
 }
 
-func (s *Server) proxyPolicy() (proxyproto.PolicyFunc, error) {
+func (s *Server) proxyPolicy() (proxyproto.ConnPolicyFunc, error) {
 	if len(s.Config.Server.ProxyAllowed) > 0 {
-		return proxyproto.StrictWhiteListPolicy(s.Config.Server.ProxyAllowed)
+		return proxyproto.ConnStrictWhiteListPolicy(s.Config.Server.ProxyAllowed)
 	}
 
 	// Set the Policy value based on config
 	// Values are taken from https://github.com/pires/go-proxyproto/blob/195fedcfbfc1be163f3a0d507fac1709e9d81fed/policy.go#L20
 	switch strings.ToLower(s.Config.Server.ProxyPolicy) {
-	case "require":
+	case proxyPolicyRequire:
 		return staticProxyPolicy(proxyproto.REQUIRE), nil
-	case "ignore":
+	case proxyPolicyIgnore:
 		return staticProxyPolicy(proxyproto.IGNORE), nil
-	case "reject":
+	case proxyPolicyReject:
 		return staticProxyPolicy(proxyproto.REJECT), nil
 	default:
 		return staticProxyPolicy(proxyproto.USE), nil
 	}
-}
-
-func extractDataFromContext(ctx context.Context) command.LogData {
-	logData := command.LogData{}
-
-	if ctx == nil {
-		return logData
-	}
-
-	if ctx.Value("logData") != nil {
-		logData = ctx.Value("logData").(command.LogData)
-	}
-
-	return logData
 }
 
 func extractLogDataFromContext(ctx context.Context) command.LogData {
@@ -293,8 +299,8 @@ func extractLogDataFromContext(ctx context.Context) command.LogData {
 	return logData
 }
 
-func staticProxyPolicy(policy proxyproto.Policy) proxyproto.PolicyFunc {
-	return func(_ net.Addr) (proxyproto.Policy, error) {
+func staticProxyPolicy(policy proxyproto.Policy) proxyproto.ConnPolicyFunc {
+	return func(_ proxyproto.ConnPolicyOptions) (proxyproto.Policy, error) {
 		return policy, nil
 	}
 }

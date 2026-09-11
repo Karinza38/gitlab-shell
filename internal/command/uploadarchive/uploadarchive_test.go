@@ -3,6 +3,7 @@ package uploadarchive
 import (
 	"bytes"
 	"context"
+	"io"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -47,12 +48,16 @@ func setup(t *testing.T, keyID string, requests []testserver.TestRequestHandler)
 	url := testserver.StartHTTPServer(t, requests)
 
 	output := &bytes.Buffer{}
-	input := bytes.NewBufferString("input")
+	pipeReader, pipeWriter := io.Pipe()
+	t.Cleanup(func() {
+		pipeWriter.Close()
+		pipeReader.Close()
+	})
 
 	cmd := &Command{
-		Config:     &config.Config{GitlabUrl: url},
+		Config:     &config.Config{GitlabURL: url},
 		Args:       &commandargs.Shell{GitlabKeyID: keyID, SSHArgs: []string{"git-upload-archive", "group/repo"}},
-		ReadWriter: &readwriter.ReadWriter{ErrOut: output, Out: output, In: input},
+		ReadWriter: &readwriter.ReadWriter{ErrOut: output, Out: output, In: pipeReader},
 	}
 
 	return cmd

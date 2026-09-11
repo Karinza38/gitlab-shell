@@ -3,20 +3,35 @@ package accessverifier
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	pb "gitlab.com/gitlab-org/gitaly/v16/proto/go/gitalypb"
+	tspb "gitlab.com/gitlab-org/cells/topology-service/clients/go/proto"
+	pb "gitlab.com/gitlab-org/gitaly/v18/proto/go/gitalypb"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/client/testserver"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/commandargs"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/config"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/sshenv"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/testhelper"
+	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/topology"
+	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/topology/topologytest"
+)
+
+const (
+	testUsername = "user-1"
+	customAction = "custom"
+	testIPv4     = "18.245.0.42"
+	testIPv6     = "2001:0db8:85a3:0000:0000:8a2e:0370:7334"
 )
 
 var (
@@ -30,7 +45,7 @@ var (
 func buildExpectedResponse(who string) *Response {
 	response := &Response{
 		Success:          true,
-		UserID:           "user-1",
+		UserID:           testUsername,
 		Repo:             "project-26",
 		Username:         "root",
 		GitConfigOptions: []string{"option"},
@@ -76,11 +91,11 @@ func TestSuccessfulResponses(t *testing.T) {
 		}, {
 			desc: "Provide username within the request",
 			args: &commandargs.Shell{GitlabUsername: "first", Env: defaultEnv},
-			who:  "user-1",
+			who:  testUsername,
 		}, {
 			desc: "Provide krb5principal within the request",
 			args: &commandargs.Shell{GitlabKrb5Principal: "test@TEST.TEST"},
-			who:  "user-1",
+			who:  testUsername,
 		},
 	}
 
@@ -98,25 +113,24 @@ func TestSuccessfulResponses(t *testing.T) {
 func TestGeoPushGetCustomAction(t *testing.T) {
 	testRoot := testhelper.PrepareTestRootDir(t)
 	client := setup(t, map[string]testResponse{
-		"custom": {
+		customAction: {
 			body:   responseBody(t, testRoot, "allowed_with_push_payload.json"),
 			status: 300,
 		},
 	}, nil)
 
-	args := &commandargs.Shell{GitlabUsername: "custom", Env: defaultEnv}
+	args := &commandargs.Shell{GitlabUsername: customAction, Env: defaultEnv}
 	result, err := client.Verify(context.Background(), args, receivePackAction, repo)
 	require.NoError(t, err)
 
-	response := buildExpectedResponse("user-1")
+	response := buildExpectedResponse(testUsername)
 	response.Payload = CustomPayload{
 		Action: "geo_proxy_to_primary",
 		Data: CustomPayloadData{
-			APIEndpoints:            []string{"geo/proxy_git_ssh/info_refs_receive_pack", "geo/proxy_git_ssh/receive_pack"},
-			GeoProxyDirectToPrimary: true,
-			RequestHeaders:          map[string]string{"Authorization": "Bearer token"},
-			Username:                "custom",
-			PrimaryRepo:             "https://repo/path",
+			APIEndpoints:   []string{"geo/proxy_git_ssh/info_refs_receive_pack", "geo/proxy_git_ssh/receive_pack"},
+			RequestHeaders: map[string]string{"Authorization": "Bearer token"},
+			Username:       customAction,
+			PrimaryRepo:    "https://repo/path",
 		},
 	}
 	response.StatusCode = 300
@@ -128,25 +142,24 @@ func TestGeoPushGetCustomAction(t *testing.T) {
 func TestGeoPullGetCustomAction(t *testing.T) {
 	testRoot := testhelper.PrepareTestRootDir(t)
 	client := setup(t, map[string]testResponse{
-		"custom": {
+		customAction: {
 			body:   responseBody(t, testRoot, "allowed_with_pull_payload.json"),
 			status: 300,
 		},
 	}, nil)
 
-	args := &commandargs.Shell{GitlabUsername: "custom", Env: defaultEnv}
+	args := &commandargs.Shell{GitlabUsername: customAction, Env: defaultEnv}
 	result, err := client.Verify(context.Background(), args, uploadPackAction, repo)
 	require.NoError(t, err)
 
-	response := buildExpectedResponse("user-1")
+	response := buildExpectedResponse(testUsername)
 	response.Payload = CustomPayload{
 		Action: "geo_proxy_to_primary",
 		Data: CustomPayloadData{
-			APIEndpoints:                 []string{"geo/proxy_git_ssh/info_refs_upload_pack", "geo/proxy_git_ssh/upload_pack"},
-			Username:                     "custom",
-			GeoProxyFetchDirectToPrimary: true,
-			PrimaryRepo:                  "https://repo/path",
-			RequestHeaders:               map[string]string{"Authorization": "Bearer token"},
+			APIEndpoints:   []string{"geo/proxy_git_ssh/info_refs_upload_pack", "geo/proxy_git_ssh/upload_pack"},
+			Username:       customAction,
+			PrimaryRepo:    "https://repo/path",
+			RequestHeaders: map[string]string{"Authorization": "Bearer token"},
 		},
 	}
 	response.StatusCode = 300
@@ -203,23 +216,23 @@ func TestCheckIP(t *testing.T) {
 	}{
 		{
 			desc:            "IPv4 address",
-			remoteAddr:      "18.245.0.42",
-			expectedCheckIP: "18.245.0.42",
+			remoteAddr:      testIPv4,
+			expectedCheckIP: testIPv4,
 		},
 		{
 			desc:            "IPv6 address",
-			remoteAddr:      "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
-			expectedCheckIP: "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+			remoteAddr:      testIPv6,
+			expectedCheckIP: testIPv6,
 		},
 		{
 			desc:            "Host and port",
 			remoteAddr:      "18.245.0.42:6345",
-			expectedCheckIP: "18.245.0.42",
+			expectedCheckIP: testIPv4,
 		},
 		{
 			desc:            "IPv6 host and port",
 			remoteAddr:      "[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:80",
-			expectedCheckIP: "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+			expectedCheckIP: testIPv6,
 		},
 		{
 			desc:            "Bad remote addr",
@@ -286,10 +299,165 @@ func setup(t *testing.T, userResponses, keyResponses map[string]testResponse) *C
 
 	url := testserver.StartSocketHTTPServer(t, requests)
 
-	client, err := NewClient(&config.Config{GitlabUrl: url})
+	client, err := NewClient(&config.Config{GitlabURL: url})
 	require.NoError(t, err)
 
 	return client
+}
+
+func TestVerifyWithTopologyService(t *testing.T) {
+	testRoot := testhelper.PrepareTestRootDir(t)
+
+	t.Run("routes /allowed to cell when TS returns PROXY", func(t *testing.T) {
+		// Set up cell HTTP server
+		var cellReceived bool
+		cellServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cellReceived = true
+			// Verify auth headers survive the WithHost swap
+			assert.NotEmpty(t, r.Header.Get("Gitlab-Shell-Api-Request"), "JWT header must be present on cell request")
+			assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
+			assert.NotEmpty(t, r.Header.Get("User-Agent"))
+			w.Header().Set("Content-Type", "application/json")
+			body := responseBody(t, testRoot, "allowed.json")
+			_, _ = w.Write(body)
+		}))
+		t.Cleanup(cellServer.Close)
+
+		// Set up default HTTP server (should NOT receive the request)
+		var defaultReceived bool
+		defaultServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			defaultReceived = true
+			w.Header().Set("Content-Type", "application/json")
+			body := responseBody(t, testRoot, "allowed.json")
+			_, _ = w.Write(body)
+		}))
+		t.Cleanup(defaultServer.Close)
+
+		// Set up mock TS that returns a PROXY action pointing to the cell.
+		// The Resolver applies the configured cell endpoint scheme and port.
+		cell := topologytest.CellAddressWithBogusPort(t, cellServer, 1)
+
+		mock := &topologytest.MockClassifyServer{
+			Response: &tspb.ClassifyResponse{
+				Action: tspb.ClassifyAction_PROXY,
+				Proxy:  &tspb.ProxyInfo{Address: cell.TopologyAddress},
+			},
+		}
+		tsAddr, tsStop := topologytest.StartMockServer(t, mock)
+		t.Cleanup(tsStop)
+
+		tsClient := topology.NewClient(&topology.Config{
+			Enabled: true,
+			Address: tsAddr,
+			Timeout: 5 * time.Second,
+		})
+		t.Cleanup(func() { _ = tsClient.Close() })
+
+		cfg := &config.Config{
+			GitlabURL:      defaultServer.URL,
+			Secret:         "test-secret",
+			TopologyClient: tsClient,
+			TopologyService: topology.Config{
+				Enabled:      true,
+				CellEndpoint: topology.CellEndpointConfig{Scheme: "http", Port: cell.RealPort},
+			},
+		}
+
+		client, err := NewClient(cfg)
+		require.NoError(t, err)
+
+		args := &commandargs.Shell{GitlabKeyID: "1"}
+		result, err := client.Verify(context.Background(), args, receivePackAction, repo)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		require.True(t, result.Success)
+
+		require.True(t, cellReceived, "request should have been sent to the cell server")
+		require.False(t, defaultReceived, "request should NOT have been sent to the default server")
+
+		cellHost, _, err := net.SplitHostPort(cell.TopologyAddress)
+		require.NoError(t, err)
+		require.Equal(t, "http://"+net.JoinHostPort(cellHost, strconv.Itoa(cell.RealPort)), result.CellAddress)
+	})
+
+	t.Run("falls back to default when TS is nil", func(t *testing.T) {
+		var defaultReceived bool
+		defaultServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			defaultReceived = true
+			w.Header().Set("Content-Type", "application/json")
+			body := responseBody(t, testRoot, "allowed.json")
+			_, _ = w.Write(body)
+		}))
+		t.Cleanup(defaultServer.Close)
+
+		cfg := &config.Config{
+			GitlabURL:      defaultServer.URL,
+			TopologyClient: nil,
+		}
+
+		client, err := NewClient(cfg)
+		require.NoError(t, err)
+
+		args := &commandargs.Shell{GitlabKeyID: "1"}
+		result, err := client.Verify(context.Background(), args, receivePackAction, repo)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		require.True(t, result.Success)
+		require.True(t, defaultReceived, "request should have been sent to the default server")
+		require.Empty(t, result.CellAddress)
+	})
+
+	t.Run("falls back to default when TS returns error", func(t *testing.T) {
+		var defaultReceived bool
+		defaultServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			defaultReceived = true
+			w.Header().Set("Content-Type", "application/json")
+			body := responseBody(t, testRoot, "allowed.json")
+			_, _ = w.Write(body)
+		}))
+		t.Cleanup(defaultServer.Close)
+
+		mock := &topologytest.MockClassifyServer{
+			Err: fmt.Errorf("TS unavailable"),
+		}
+		tsAddr, tsStop := topologytest.StartMockServer(t, mock)
+		t.Cleanup(tsStop)
+
+		tsClient := topology.NewClient(&topology.Config{
+			Enabled: true,
+			Address: tsAddr,
+			Timeout: 5 * time.Second,
+		})
+		t.Cleanup(func() { _ = tsClient.Close() })
+
+		cfg := &config.Config{
+			GitlabURL:      defaultServer.URL,
+			TopologyClient: tsClient,
+		}
+
+		client, err := NewClient(cfg)
+		require.NoError(t, err)
+
+		args := &commandargs.Shell{GitlabKeyID: "1"}
+		result, err := client.Verify(context.Background(), args, receivePackAction, repo)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		require.True(t, result.Success)
+		require.True(t, defaultReceived, "request should have fallen back to the default server")
+		require.Empty(t, result.CellAddress)
+	})
+}
+
+func TestIsCellRouted(t *testing.T) {
+	t.Run("returns true when CellAddress is set", func(t *testing.T) {
+		response := &Response{CellAddress: "http://cell1.example.com"}
+		require.True(t, response.IsCellRouted())
+	})
+
+	t.Run("returns false when CellAddress is empty", func(t *testing.T) {
+		response := &Response{}
+		require.False(t, response.IsCellRouted())
+	})
 }
 
 func setupWithAPIInspector(t *testing.T, inspector func(*Request)) *Client {
@@ -312,7 +480,7 @@ func setupWithAPIInspector(t *testing.T, inspector func(*Request)) *Client {
 
 	url := testserver.StartSocketHTTPServer(t, requests)
 
-	client, err := NewClient(&config.Config{GitlabUrl: url})
+	client, err := NewClient(&config.Config{GitlabURL: url})
 	require.NoError(t, err)
 
 	return client

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -11,7 +12,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	grpcstatus "google.golang.org/grpc/status"
 
-	pb "gitlab.com/gitlab-org/gitaly/v16/proto/go/gitalypb"
+	pb "gitlab.com/gitlab-org/gitaly/v18/proto/go/gitalypb"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/command/commandargs"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/config"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/gitlabnet/accessverifier"
@@ -19,6 +20,11 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+)
+
+const (
+	testListenAddr = "tcp://localhost:9999"
+	featureEnabled = "true"
 )
 
 func makeHandler(t *testing.T, err error) func(context.Context, *grpc.ClientConn) (int32, error) {
@@ -35,7 +41,7 @@ func TestRunGitalyCommand(t *testing.T) {
 		newConfig(),
 		string(commandargs.UploadPack),
 		&accessverifier.Response{
-			Gitaly: accessverifier.Gitaly{Address: "tcp://localhost:9999"},
+			Gitaly: accessverifier.Gitaly{Address: testListenAddr},
 		},
 	)
 
@@ -53,7 +59,7 @@ func TestCachingOfGitalyConnections(t *testing.T) {
 	response := &accessverifier.Response{
 		Username: "user",
 		Gitaly: accessverifier.Gitaly{
-			Address: "tcp://localhost:9999",
+			Address: testListenAddr,
 			Token:   "token",
 		},
 	}
@@ -83,7 +89,7 @@ func TestUnavailableGitalyErr(t *testing.T) {
 		newConfig(),
 		string(commandargs.UploadPack),
 		&accessverifier.Response{
-			Gitaly: accessverifier.Gitaly{Address: "tcp://localhost:9999"},
+			Gitaly: accessverifier.Gitaly{Address: testListenAddr},
 		},
 	)
 
@@ -96,7 +102,7 @@ func TestGitalyLimitErr(t *testing.T) {
 		newConfig(),
 		string(commandargs.UploadPack),
 		&accessverifier.Response{
-			Gitaly: accessverifier.Gitaly{Address: "tcp://localhost:9999"},
+			Gitaly: accessverifier.Gitaly{Address: testListenAddr},
 		},
 	)
 	limitErr := errWithDetail(t, &pb.LimitError{
@@ -119,17 +125,17 @@ func TestRunGitalyCommandMetadata(t *testing.T) {
 				string(commandargs.UploadPack),
 				&accessverifier.Response{
 					Gitaly: accessverifier.Gitaly{
-						Address: "tcp://localhost:9999",
+						Address: testListenAddr,
 						Features: map[string]string{
-							"gitaly-feature-cache_invalidator":        "true",
-							"other-ff":                                "true",
+							"gitaly-feature-cache_invalidator":        featureEnabled,
+							"other-ff":                                featureEnabled,
 							"gitaly-feature-inforef_uploadpack_cache": "false",
 						},
 					},
 				},
 			),
 			want: map[string]string{
-				"gitaly-feature-cache_invalidator":        "true",
+				"gitaly-feature-cache_invalidator":        featureEnabled,
 				"gitaly-feature-inforef_uploadpack_cache": "false",
 			},
 		},
@@ -175,10 +181,10 @@ func TestPrepareContext(t *testing.T) {
 				&accessverifier.Response{
 					KeyID:    1,
 					KeyType:  "key",
-					UserID:   "6",
+					UserID:   "user-6",
 					Username: "jane.doe",
 					Gitaly: accessverifier.Gitaly{
-						Address: "tcp://localhost:9999",
+						Address: testListenAddr,
 					},
 				},
 			),
@@ -198,7 +204,7 @@ func TestPrepareContext(t *testing.T) {
 			want: map[string]string{
 				"key_id":    "1",
 				"key_type":  "key",
-				"user_id":   "6",
+				"user_id":   "user-6",
 				"username":  "jane.doe",
 				"remote_ip": "10.0.0.1",
 			},
@@ -241,4 +247,34 @@ func errWithDetail(t *testing.T, detail proto.Message) error {
 	proto.Details = append(proto.Details, marshaled)
 
 	return grpcstatus.ErrorProto(proto)
+}
+
+func TestNewGitalyCommandWithRetryConfig(t *testing.T) {
+	retryConfig := json.RawMessage(`{"maxAttempts":4,"initialBackoff":"0.1s","maxBackoff":"1s","backoffMultiplier":2,"retryableStatusCodes":["UNAVAILABLE"]}`)
+
+	cmd := NewGitalyCommand(
+		newConfig(),
+		string(commandargs.UploadPack),
+		&accessverifier.Response{
+			Gitaly:      accessverifier.Gitaly{Address: testListenAddr},
+			RetryConfig: retryConfig,
+		},
+	)
+
+	require.NotNil(t, cmd.Command.RetryPolicy)
+	require.Equal(t, uint32(4), cmd.Command.RetryPolicy.MaxAttempts)
+	require.InEpsilon(t, float32(2), cmd.Command.RetryPolicy.BackoffMultiplier, 0.0001)
+	require.Equal(t, []string{"UNAVAILABLE"}, cmd.Command.RetryPolicy.RetryableStatusCodes)
+}
+
+func TestNewGitalyCommandWithoutRetryConfig(t *testing.T) {
+	cmd := NewGitalyCommand(
+		newConfig(),
+		string(commandargs.UploadPack),
+		&accessverifier.Response{
+			Gitaly: accessverifier.Gitaly{Address: testListenAddr},
+		},
+	)
+
+	require.Nil(t, cmd.Command.RetryPolicy)
 }

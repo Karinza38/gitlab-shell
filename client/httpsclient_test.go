@@ -60,7 +60,7 @@ func TestSuccessfulRequests(t *testing.T) {
 
 			responseBody, err := io.ReadAll(response.Body)
 			require.NoError(t, err)
-			require.Equal(t, string(responseBody), "Hello")
+			require.Equal(t, "Hello", string(responseBody))
 		})
 	}
 }
@@ -78,7 +78,7 @@ func TestFailedRequests(t *testing.T) {
 		{
 			desc:          "Invalid CaFile",
 			caFile:        path.Join(testRoot, "certs/invalid/server.crt"),
-			expectedError: "Internal API unreachable",
+			expectedError: internalAPIUnreachable,
 		},
 		{
 			desc:                   "Missing CaFile",
@@ -88,11 +88,11 @@ func TestFailedRequests(t *testing.T) {
 		{
 			desc:          "Invalid CaPath",
 			caPath:        path.Join(testRoot, "certs/invalid"),
-			expectedError: "Internal API unreachable",
+			expectedError: internalAPIUnreachable,
 		},
 		{
 			desc:          "Empty config",
-			expectedError: "Internal API unreachable",
+			expectedError: internalAPIUnreachable,
 		},
 	}
 
@@ -103,10 +103,13 @@ func TestFailedRequests(t *testing.T) {
 				require.Error(t, err)
 				require.ErrorIs(t, err, ErrCafileNotFound)
 			} else {
-				_, err = client.Get(context.Background(), "/hello")
+				response, err := client.Get(context.Background(), "/hello")
+				if response != nil {
+					response.Body.Close()
+				}
 				require.Error(t, err)
 
-				require.Equal(t, err.Error(), tc.expectedError)
+				require.Equal(t, tc.expectedError, err.Error())
 			}
 		})
 	}
@@ -126,7 +129,7 @@ func setupWithRequests(t *testing.T, caFile, caPath, clientCAPath, clientCertPat
 
 	url := testserver.StartHTTPSServer(t, requests, clientCAPath)
 
-	opts := defaultHttpOpts
+	opts := defaultHTTPOpts
 	if clientCertPath != "" && clientKeyPath != "" {
 		opts = append(opts, WithClientCert(clientCertPath, clientKeyPath))
 	}

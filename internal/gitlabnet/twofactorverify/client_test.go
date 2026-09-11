@@ -30,19 +30,19 @@ func initialize(t *testing.T) []testserver.TestRequestHandler {
 		switch requestBody.KeyID {
 		case "0":
 			body := map[string]interface{}{
-				"success": true,
+				successResponse: true,
 			}
 			assert.NoError(t, json.NewEncoder(w).Encode(body))
 		case "1":
 			body := map[string]interface{}{
-				"success": false,
-				"message": "error message",
+				successResponse: false,
+				"message":       "error message",
 			}
 			assert.NoError(t, json.NewEncoder(w).Encode(body))
 		case "2":
 			w.WriteHeader(http.StatusForbidden)
 			body := &client.ErrorResponse{
-				Message: "Not allowed!",
+				Message: notAllowedMsg,
 			}
 			assert.NoError(t, json.NewEncoder(w).Encode(body))
 		case "3":
@@ -53,7 +53,7 @@ func initialize(t *testing.T) []testserver.TestRequestHandler {
 
 		if requestBody.UserID == 1 {
 			body := map[string]interface{}{
-				"success": true,
+				successResponse: true,
 			}
 			assert.NoError(t, json.NewEncoder(w).Encode(body))
 		}
@@ -85,7 +85,9 @@ func initialize(t *testing.T) []testserver.TestRequestHandler {
 }
 
 const (
-	otpAttempt = "123456"
+	otpAttempt      = "123456"
+	successResponse = "success"
+	notAllowedMsg   = "Not allowed!"
 )
 
 func TestVerifyOTPByKeyId(t *testing.T) {
@@ -109,7 +111,7 @@ func TestErrorMessage(t *testing.T) {
 
 	args := &commandargs.Shell{GitlabKeyID: "1"}
 	err := client.VerifyOTP(context.Background(), args, otpAttempt)
-	require.Equal(t, "error message", err.Error())
+	require.EqualError(t, err, "error message")
 }
 
 func TestErrorResponses(t *testing.T) {
@@ -123,7 +125,7 @@ func TestErrorResponses(t *testing.T) {
 		{
 			desc:          "A response with an error message",
 			fakeID:        "2",
-			expectedError: "Not allowed!",
+			expectedError: notAllowedMsg,
 		},
 		{
 			desc:          "A response with bad JSON",
@@ -160,7 +162,7 @@ func TestErrorMessagePush(t *testing.T) {
 
 	args := &commandargs.Shell{GitlabKeyID: "1"}
 	err := client.PushAuth(context.Background(), args)
-	require.Equal(t, "error message", err.Error())
+	require.EqualError(t, err, "error message")
 }
 
 func TestErrorResponsesPush(t *testing.T) {
@@ -174,7 +176,7 @@ func TestErrorResponsesPush(t *testing.T) {
 		{
 			desc:          "A response with an error message",
 			fakeID:        "2",
-			expectedError: "Not allowed!",
+			expectedError: notAllowedMsg,
 		},
 		{
 			desc:          "A response with bad JSON",
@@ -202,7 +204,7 @@ func setup(t *testing.T) *Client {
 	requests := initialize(t)
 	url := testserver.StartSocketHTTPServer(t, requests)
 
-	client, err := NewClient(&config.Config{GitlabUrl: url})
+	client, err := NewClient(&config.Config{GitlabURL: url})
 	require.NoError(t, err)
 
 	return client

@@ -16,7 +16,7 @@ var (
 	requests = []testserver.TestRequestHandler{
 		{
 			Path: "/api/v4/internal/check",
-			Handler: func(w http.ResponseWriter, r *http.Request) {
+			Handler: func(w http.ResponseWriter, _ *http.Request) {
 				json.NewEncoder(w).Encode(testResponse)
 			},
 		},
@@ -41,7 +41,7 @@ func TestCheck(t *testing.T) {
 func setup(t *testing.T) *Client {
 	url := testserver.StartSocketHTTPServer(t, requests)
 
-	client, err := NewClient(&config.Config{GitlabUrl: url})
+	client, err := NewClient(&config.Config{GitlabURL: url})
 	require.NoError(t, err)
 
 	return client

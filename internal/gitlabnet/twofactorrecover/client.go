@@ -12,12 +12,14 @@ import (
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/config"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/gitlabnet"
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/gitlabnet/discover"
+	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/topology"
 )
 
 // Client represents a client for interacting with GitLab Two-Factor Authentication recovery codes
 type Client struct {
-	config *config.Config
-	client *client.GitlabNetClient
+	config   *config.Config
+	client   *client.GitlabNetClient
+	resolver *topology.Resolver
 }
 
 // Response represents the response structure for Two-Factor Authentication recovery code requests
@@ -40,7 +42,11 @@ func NewClient(config *config.Config) (*Client, error) {
 		return nil, fmt.Errorf("error creating http client: %v", err)
 	}
 
-	return &Client{config: config, client: client}, nil
+	return &Client{
+		config:   config,
+		client:   client,
+		resolver: config.NewTopologyResolver(),
+	}, nil
 }
 
 // GetRecoveryCodes retrieves the recovery codes for the specified user
@@ -51,7 +57,8 @@ func (c *Client) GetRecoveryCodes(ctx context.Context, args *commandargs.Shell) 
 		return nil, err
 	}
 
-	response, err := c.client.Post(ctx, "/two_factor_recovery_codes", requestBody)
+	routed := c.resolver.ClientForUserArgs(ctx, c.client, args.UserArgs())
+	response, err := routed.Client.Post(ctx, "/two_factor_recovery_codes", requestBody)
 	if err != nil {
 		return nil, err
 	}

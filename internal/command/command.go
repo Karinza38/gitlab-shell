@@ -1,21 +1,33 @@
+// Package command provides the core command execution infrastructure for gitlab-shell.
+// It defines the Command interface that all shell commands must implement,
+// along with shared utilities for logging, tracing, and context management.
 package command
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path"
 	"strings"
+	"time"
 
 	"gitlab.com/gitlab-org/gitlab-shell/v14/internal/config"
 	"gitlab.com/gitlab-org/labkit/correlation"
 	"gitlab.com/gitlab-org/labkit/tracing"
+	"gitlab.com/gitlab-org/labkit/v2/featureflag"
+	"gitlab.com/gitlab-org/labkit/v2/fields"
+	"gitlab.com/gitlab-org/labkit/v2/httpclient"
+	"gitlab.com/gitlab-org/labkit/v2/log"
 )
 
+// Command is the interface that all gitlab-shell commands must implement.
+// Execute runs the command and returns the updated context and any error.
 type Command interface {
 	Execute(ctx context.Context) (context.Context, error)
 }
 
+// LogMetadata contains project and namespace information for structured logging.
 type LogMetadata struct {
 	Project         string `json:"project,omitempty"`
 	RootNamespace   string `json:"root_namespace,omitempty"`
@@ -23,12 +35,26 @@ type LogMetadata struct {
 	RootNamespaceID int    `json:"root_namespace_id,omitempty"`
 }
 
+// LogData contains user and request information for structured logging.
 type LogData struct {
 	Username     string      `json:"username"`
 	WrittenBytes int64       `json:"written_bytes"`
 	Meta         LogMetadata `json:"meta"`
 }
 
+type contextKey string
+
+// LogDataKey is the context key used to store log data in request contexts.
+const LogDataKey contextKey = "logData"
+
+// featureFlagClientKey is the context key used to store the feature flag evaluator.
+const featureFlagClientKey contextKey = "featureFlagClient"
+
+// featureFlagEndpointEnv is the environment variable name for the feature flag service endpoint.
+const featureFlagEndpointEnv = "FEATURE_FLAG_ENDPOINT"
+
+// CheckForVersionFlag checks if the -version flag was passed and prints version info if so.
+// It exits the program after printing the version.
 func CheckForVersionFlag(osArgs []string, version, buildTime string) {
 	// We can't use the flag library because gitlab-shell receives other arguments
 	// that confuse the parser.
@@ -40,9 +66,41 @@ func CheckForVersionFlag(osArgs []string, version, buildTime string) {
 	}
 }
 
-// Setup() initializes tracing from the configuration file and generates a
+// setupFeatureFlagClient initializes the feature flag client if FEATURE_FLAG_ENDPOINT is configured.
+// Returns nil evaluator and shutdown function if the endpoint is not set or initialization fails.
+func setupFeatureFlagClient(ctx context.Context, serviceName string) (featureflag.Evaluator, func(context.Context) error) {
+	if os.Getenv(featureFlagEndpointEnv) == "" {
+		return nil, nil
+	}
+
+	ffHTTPClient := httpclient.NewWithConfig(&httpclient.Config{
+		Timeout: 1 * time.Second,
+	}).HTTPClient()
+
+	client, err := featureflag.NewWithConfig(ctx, &featureflag.Config{
+		Name:       serviceName,
+		Namespace:  "gitlab-shell",
+		CacheTTL:   60 * time.Second,
+		CacheSize:  1000,
+		HTTPClient: ffHTTPClient,
+	})
+	if err != nil {
+		log.FromContext(ctx).WarnContext(ctx, "feature flag client initialization failed", log.Error(err))
+		return nil, nil
+	}
+
+	return client, client.Shutdown
+}
+
+// Setup initializes tracing from the configuration file and generates a
 // background context from which all other contexts in the process should derive
 // from, as it has a service name and initial correlation ID set.
+//
+// A labkit v2 feature flag client is created when the FEATURE_FLAG_ENDPOINT
+// environment variable is set. The client is stored in the returned context
+// and can be retrieved with FeatureFlagEvaluatorFromContext. If no endpoint is
+// configured the client is omitted and flag checks default to false — startup
+// is never blocked by a missing Flipt server.
 func Setup(serviceName string, config *config.Config) (context.Context, func()) {
 	closer := tracing.Initialize(
 		tracing.WithServiceName(serviceName),
@@ -66,16 +124,44 @@ func Setup(serviceName string, config *config.Config) (context.Context, func()) 
 
 	correlationID := correlation.ExtractFromContext(ctx)
 	if correlationID == "" {
-		correlationID := correlation.SafeRandomID()
+		correlationID = correlation.SafeRandomID()
 		ctx = correlation.ContextWithCorrelation(ctx, correlationID)
 	}
 
+	ctx = log.WithLogger(ctx, slog.Default().With(slog.String(fields.CorrelationID, correlationID)))
+
+	ffEvaluator, ffShutdown := setupFeatureFlagClient(ctx, serviceName)
+	if ffEvaluator != nil {
+		ctx = context.WithValue(ctx, featureFlagClientKey, ffEvaluator)
+	}
+
 	return ctx, func() {
+		if ffShutdown != nil {
+			if err := ffShutdown(ctx); err != nil {
+				log.FromContext(ctx).WarnContext(ctx, "feature flag client shutdown error", log.Error(err))
+			}
+		}
 		finished()
-		closer.Close()
+		_ = closer.Close()
 	}
 }
 
+// FeatureFlagEvaluatorFromContext returns the feature flag evaluator stored in
+// ctx by Setup, or nil if no evaluator was registered (e.g. FEATURE_FLAG_ENDPOINT
+// is not set). Callers must treat a nil return as "all flags off".
+func FeatureFlagEvaluatorFromContext(ctx context.Context) featureflag.Evaluator {
+	v, _ := ctx.Value(featureFlagClientKey).(featureflag.Evaluator)
+	return v
+}
+
+// ContextWithEvaluator returns ctx with the given evaluator stored under the
+// feature flag client key. Intended for use in tests only.
+func ContextWithEvaluator(ctx context.Context, evaluator featureflag.Evaluator) context.Context {
+	return context.WithValue(ctx, featureFlagClientKey, evaluator)
+}
+
+// NewLogData creates a new LogData instance with the given project, username, and IDs.
+// It extracts the root namespace from the project path.
 func NewLogData(project, username string, projectID, rootNamespaceID int) LogData {
 	rootNameSpace := ""
 
